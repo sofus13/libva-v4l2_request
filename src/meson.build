@@ -1,0 +1,25 @@
+sources = [
+  'driver.c',
+  'handles.c',
+  'context.c',
+  'convert.c',
+  'decode.c',
+  'surface.c',
+  'buffer.c',
+  'image.c',
+  'codec_mpeg2.c',
+  'codec_h264.c',
+  'codec_hevc.c',
+  'codec_vp8.c',
+  'codec_vp9.c',
+  'codec_av1.c',
+]
+
+shared_module('v4l2_request_drv_video',
+              sources,
+              name_prefix: '',
+              include_directories: root_inc,
+              c_args: ['-fvisibility=hidden'],
+              dependencies: [libva_dep, libdrm_dep, threads_dep],
+              install: true,
+              install_dir: driverdir)

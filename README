@@ -1,0 +1,397 @@
+libva-v4l2_request
+==================
+
+A VA-API (libva) backend driver for V4L2 stateless video decoders using
+the Media Request API. This API and VA-API are generic APIs, and the driver
+is written in such a way that it does not hardcode RK3399 reality, but
+it was so far developed mostly on Pinebook Pro (RK3399) with some minor
+testing done on Orange Pi 5+ (RK3588) and is thus fine-tuned for the use
+on RK3399 and RK3588. It will likely need some tuning to run optimally on
+other SoCs that have upstream Linux stateless video decode drivers.
+
+Specifically on RK3588 it's impossible to support HEVC decoding using VA-API,
+AFAIK, due to major, un-workaroundable API mismatch. On RK3399 the support
+is very good for all codecs the HW supports. You'll be able to have HW
+acceleration out of the box on Firefox and in mpv just by installing the
+VA-API driver. No patching of other projects is needed. For HEVC decoding
+you'll need a kernel patch for RGA2 driver, which is used to convert 10bit
+NV15 pixel format to NV12 understood by unpatched upstream mpv/ffmpeg/Firefox
+projects. See details below.
+
+Supported codecs (compiled in when the kernel uAPI headers provide the
+stateless interface): MPEG-2, H.264, HEVC, VP8, VP9, AV1.
+
+On Rockchip SoCs whose decoders emit 10-bit content only as packed NV15
+(which no GPU or display controller stack can import), the driver chains
+the RGA into the decode pipeline and converts frames to NV12 in hardware;
+see "10-bit decoding and the RGA converter" below.
+
+Have fun,
+	~megi
+
+Building
+--------
+
+    meson setup build
+    ninja -C build
+    ninja -C build install     # installs into the libva driverdir
+
+Run against a specific build without installing:
+
+    export LIBVA_DRIVERS_PATH=/path/to/build/src
+    export LIBVA_DRIVER_NAME=v4l2_request
+    vainfo
+
+Environment variables:
+
+  LIBVA_V4L2_REQUEST_MEDIA_PATH=/dev/mediaN
+      Restrict device probing to a single media controller. By default
+      all /dev/media* nodes are scanned for video interfaces that
+      advertise V4L2_BUF_CAP_SUPPORTS_REQUESTS.
+
+  V4L2R_NO_CONVERT=1
+      Disable detection and use of the mem2mem format converter. Streams
+      that decode to a format nothing can consume (10-bit NV15) are then
+      refused instead of converted.
+
+
+Using with mpv
+--------------
+
+libva normally derives the driver name from the DRM driver of the render
+node, which does not point at this driver on ARM SoCs (the GPU is
+panfrost or similar), so the driver has to be selected explicitly:
+
+    export LIBVA_DRIVER_NAME=v4l2_request
+    mpv --hwdec=vaapi video.mp4
+
+That is all an installed driver needs; for an uninstalled build also set
+LIBVA_DRIVERS_PATH as shown in "Building" above. To select it
+permanently, put LIBVA_DRIVER_NAME=v4l2_request into /etc/environment
+(or set hwdec=vaapi in ~/.config/mpv/mpv.conf and export the variable
+from your session startup).
+
+Video output:
+
+  --vo=gpu (the default): decoded frames are imported into the GPU as
+      dma-bufs and composited by the render pipeline. Works with both
+      Wayland and X11.
+  --vo=dmabuf-wayland: fully zero-copy path, frames go to the Wayland
+      compositor as dma-bufs without touching the GPU; cheapest option
+      on machines like the Pinebook Pro.
+  --hwdec=vaapi-copy: readback into system memory instead of dma-buf
+      display; slower, but a useful fallback to isolate display interop
+      problems from decode problems.
+
+Verifying it works: mpv prints "Using hardware decoding (vaapi)" with
+-v, and this driver logs its device choices to stderr, e.g.:
+
+    libva-v4l2request: decoding h264 via /dev/video1 [rkvdec] (media /dev/media1)
+    libva-v4l2request: using CAPTURE format NV12 (1920x1088)
+
+10-bit HEVC/VP9 content decodes through the RGA conversion chain (see
+below) and shows up as NV12 surfaces; an additional line reports the
+converter. If mpv instead reports falling back to software decoding,
+run with --msg-level=vd=debug and check stderr for driver logs and
+dmesg for kernel driver errors.
+
+Rotation offload (see "Video processing" below) is available through
+the transpose_vaapi lavfi filter:
+
+    mpv --hwdec=vaapi --vf=lavfi=[transpose_vaapi=dir=cclock] video.mp4
+
+This is especially useful on devices with a portrait panel, like the
+Pinephone Pro and its 720x1440 display: landscape video can be rotated
+by the RGA and handed to the compositor as ordinary upright dma-buf
+frames, keeping the zero-copy --vo=dmabuf-wayland path (with the phone
+held sideways) instead of paying for a GPU rotation pass on every
+frame.
+
+Note that mpv's own --video-rotate performs rotation in the GPU shader
+path instead and does not use the VA-API entrypoint.
+
+
+Running mpv on the Pinephone Pro (Weston + rotation)
+----------------------------------------------------
+
+The Pinephone Pro panel is portrait 720x1440 and the VOP cannot rotate
+planes, so landscape video has to be rotated somewhere along the way.
+A convenient setup is a one-shot Weston kiosk session that rotates the
+whole output to landscape - UI, touch input and video alike - with mpv
+handing frames over as dma-bufs.
+
+One-time setup on Arch Linux ARM: install weston and seatd, enable the
+seatd service and give the user access to the devices:
+
+    pacman -S weston seatd
+    systemctl enable --now seatd
+    usermod -aG video,input,seat <user>
+
+(video covers the decoder/RGA and KMS nodes, input the touchscreen,
+seat the seatd socket. Log in again for the groups to apply.)
+
+Then, from a VT or ssh login:
+
+    export LIBVA_DRIVER_NAME=v4l2_request
+
+    cat > west.conf <<EOF
+    [output]
+    name=DSI-1
+    transform=rotate-90
+    EOF
+
+    weston --config=$PWD/west.conf --shell=kiosk-shell.so -- \
+        mpv --vo=dmabuf-wayland --hwdec=vaapi --fs \
+            --script-opts=osc-scalefullscreen=2,osc-vidscale=no,osc-hidetimeout=2000,osc-layout=slimbox,osc-windowcontrols=no \
+            video.mp4
+
+The kiosk shell fullscreens the client and quits with it, so this acts
+as a single-purpose video session. --vo=dmabuf-wayland passes decoded
+NV12 frames (including 10-bit content downconverted by the RGA chain)
+to Weston without copies; the osc-* options make the on-screen controls
+usable on the small touchscreen.
+
+With transform=rotate-90 the rotation happens in Weston's GL compositing
+pass. To rotate on the RGA instead, drop the transform from west.conf
+and add the video processing filter:
+
+    --vf=lavfi=[transpose_vaapi=dir=clock]
+
+The video then arrives at the compositor already upright, which keeps
+the frames eligible for direct plane scanout (no GPU touch at all) -
+but mpv's UI and the touch mapping stay portrait, so this suits
+plain "play a file fullscreen" use rather than interactive control.
+
+Scaling can be offloaded to the RGA the same way: scale_vaapi runs
+through the same video processing entrypoint, so a 1080p stream can be
+brought down to the panel size already in the filter chain:
+
+    --vf=lavfi=[transpose_vaapi=dir=clock,scale_vaapi=720:1280]
+
+(scale_vaapi also works on its own, without the transpose, when Weston
+does the rotating.) Each filter is one RGA pass - transpose_vaapi has
+no output size parameter, so rotation+scaling cannot be folded into a
+single pass from ffmpeg - but the passes are cheap, and everything
+downstream (GL sampling or the plane scaler) then only touches
+panel-sized buffers instead of 1080p ones, which more than halves the
+per-frame memory traffic on the display path - worth having on a
+phone.
+
+
+Using with Firefox
+------------------
+
+Firefox decodes video in its sandboxed RDD process, and the sandbox
+blocks the device access this driver needs (open/ioctl on /dev/video*
+and /dev/media* nodes). Launch Firefox with:
+
+    export LIBVA_DRIVER_NAME=v4l2_request
+    export MOZ_DISABLE_RDD_SANDBOX=1
+    export MOZ_ENABLE_WAYLAND=1        # if not already running native Wayland
+
+and make sure VA-API decoding is enabled in about:config:
+
+    media.ffmpeg.vaapi.enabled = true
+
+Note that disabling the RDD sandbox trades away some of the protection
+Firefox normally applies to media decoding.
+
+
+Design
+------
+
+- Each VA context owns a circular queue of 4 mmap()ed OUTPUT (bitstream)
+  buffers, each permanently paired with one media request fd. Requests
+  are reused after MEDIA_REQUEST_IOC_REINIT.
+
+- Every VA surface keeps one specific CAPTURE buffer for its whole
+  lifetime, so vaExportSurfaceHandle() returns a stable dma-buf per
+  VASurfaceID (dma-buf consumers that cache imports by surface id, e.g.
+  mpv --vo=dmabuf-wayland, depend on this). Buffers are created with
+  VIDIOC_CREATE_BUFS on first use of a surface, so contexts created with
+  an empty render target list (GStreamer) work.
+
+- Frames reference each other through the V4L2 buffer timestamp, which
+  encodes the CAPTURE buffer index ((index + 1) * 1000 ns, matching
+  v4l2_timeval_to_ns()).
+
+- Because the kernel matches reference frames purely by CAPTURE timestamp
+  and does not stop a still-referenced buffer from being overwritten, a
+  surface's buffer is not reused for a new decode until every frame that
+  referenced its previous contents has been dequeued. The driver tracks,
+  per CAPTURE buffer, the submission sequence of the last frame that
+  referenced it and blocks the next decode into it until enough frames
+  have completed. This is the same guarantee FFmpeg's hwaccel gets
+  structurally from its AVBufferPool refcount.
+
+- Multi-slice H.264/HEVC frames use V4L2_BUF_FLAG_M2M_HOLD_CAPTURE_BUF;
+  H.264 queues one request per slice, HEVC batches up to the SLICE_PARAMS
+  control dimension. Both honour the driver's decode mode (slice/frame
+  based) and start code convention, queried from the control defaults.
+
+- The CAPTURE queue is configured lazily on the first frame, after the
+  codec controls (SPS etc.) have been set on the device, so the kernel
+  driver can pick a frame format matching the stream bit depth - like
+  FFmpeg's probe order.
+
+- vaEndPicture() is asynchronous; vaSyncSurface() polls and dequeues.
+
+- Surfaces that are exported or mapped *before* they were ever decoded
+  into (mpv probes formats this way: it exports bare test surfaces with
+  no decode context) get standalone dma-buf backing, allocated from a
+  decoder CAPTURE queue on a throwaway fd. The backing is dropped once
+  the surface is bound to a real decode context (kept when it serves as
+  the format converter's destination, see below).
+
+- CAPTURE format selection prefers linear, VAImage-representable formats
+  (NV12/P010) over tiled driver defaults, so dma-buf display interop and
+  readback work out of the box.
+
+- AV1: the V4L2 interface needs refresh_frame_flags, which VA-API does
+  not carry and which cannot be recovered from the tile group data. Each
+  frame's submission is therefore deferred by one frame and its exact
+  refresh mask reconstructed from the next frame's ref_frame_map. Reads
+  of a still-held surface flush it with a heuristic mask first; pipelined
+  players always get the exact value.
+
+
+10-bit decoding and the RGA converter
+-------------------------------------
+
+Rockchip decoders (rkvdec and friends) output 10-bit frames only in the
+packed NV15 layout (4 samples in 5 bytes). There is no VA fourcc for it,
+GPU drivers cannot import it, and Wayland compositors do not accept it,
+so NV15 frames are undisplayable as-is.
+
+When a plain (non-request) V4L2 mem2mem converter that can read such a
+format and write NV12 is present - the Rockchip RGA - the driver chains
+it behind the decoder (the converter is probed on first need, so plain
+8-bit playback never scans for one):
+
+- 10-bit VA configs then advertise NV12 surfaces only (FFmpeg accepts
+  the depth loss and decodes into NV12-labeled surfaces).
+- As soon as a frame's decode completes, its CAPTURE buffer is queued to
+  the converter (decoder dma-buf in, the surface's NV12 backing dma-buf
+  out) and the conversion overlaps the following decodes. Readers wait
+  for the conversion result; exports hand out the converted NV12 buffer.
+- No pixel ever passes through the CPU: decode, 10-to-8 conversion and
+  display are all zero-copy hardware paths.
+- Reference frames are unaffected; the decoder keeps referencing its own
+  NV15 buffers.
+
+Without a usable converter the driver refuses to decode such streams
+(the first decode fails and players fall back to software decoding);
+there is no software conversion fallback.
+
+IMPORTANT: the mainline rockchip-rga kernel driver does not support NV15
+sources. The required kernel patch is included in patches/:
+
+    patches/0001-media-rockchip-rga-Add-support-for-downconverting-fr.patch
+
+It adds the NV15 source format, enables the hardware 10-bit unpacker and
+10-to-8 rounding, and works around an RGA2 quirk where the direct (non
+scaling) 10-bit fetch path mis-addresses every other 128-pixel tile.
+
+
+Video processing: rotation and mirroring
+----------------------------------------
+
+The same converter backs a VAEntrypointVideoProc implementation (the
+VAProfileNone profile), which performs surface-to-surface blits with
+clockwise rotation by 90/180/270 degrees, horizontal/vertical mirroring,
+cropping and scaling. The parameters come from the standard
+VAProcPipelineParameterBuffer (rotation_state, mirror_state,
+surface_region, output_region); rotation support is advertised through
+vaQueryVideoProcPipelineCaps() rotation_flags/mirror_flags, as clients
+expect. No parametrized filters (denoise etc.) are offered - rotation and
+mirroring are pipeline parameters in VA-API, not filters.
+
+With FFmpeg this is the transpose_vaapi filter, e.g. to rotate a phone
+recording upright:
+
+    mpv --hwdec=vaapi --vf=lavfi=[transpose_vaapi=dir=cclock] video.mp4
+
+Notes:
+
+- The entrypoint only exists when the converter is present; it is probed
+  on first use of VAProfileNone, so decode-only clients still never scan
+  for it.
+- For 90/270 degree rotation the destination surface must be created with
+  the transposed dimensions (FFmpeg's transpose_vaapi does this).
+- When the source surface sits behind the 10-bit conversion chain, the
+  blit reads the raw NV15 decoder output and folds the 10-to-8-bit
+  downconversion and the rotation into a single RGA pass.
+- One synchronous mem2mem job per vaEndPicture(), imported dma-buf to
+  imported dma-buf; pixels never pass through the CPU.
+- Both source and destination are NV12 (or NV15 internally); RGB formats
+  are not wired up.
+
+
+Buffer copies
+-------------
+
+Bitstream data is copied exactly once, from the VA buffer into the
+mmap()ed OUTPUT buffer, at vaRenderPicture() time (start codes are
+inserted per slice where the driver wants Annex-B framing, so a plain
+map-through is not possible in general). The OUTPUT buffers start well
+below the raw frame size and are replaced with larger ones on the rare
+frame that outgrows them. Decoded frames are never copied by the CPU:
+
+- vaExportSurfaceHandle(DRM_PRIME_2) exports the CAPTURE buffer planes
+  (or the converted NV12 backing) as dma-buf fds, with DRM format
+  modifiers for tiled layouts (Allwinner tiled, Broadcom SAND, ARM AFBC).
+- vaDeriveImage() maps the buffer directly for linear NV12 and P010
+  single-plane layouts, reporting the surface size with the real line
+  stride.
+- vaGetImage()/vaPutImage() are copying access paths for the same linear
+  formats (full-frame, no scaling, no format conversion).
+
+
+Recovered bitstream fields
+--------------------------
+
+VA-API omits several fields the V4L2 stateless interfaces require. The
+driver re-parses small parts of the bitstream to recover them:
+
+- H.264: nal_ref_idc, idr_pic_id, pic_order_cnt_bit_size,
+  dec_ref_pic_marking_bit_size (RBSP slice header parse).
+- HEVC: NAL unit type, temporal id, short/long_term_ref_pic_set_size,
+  num_delta_pocs_of_ref_rps_idx (slice segment header parse).
+- VP9: segmentation feature data, loop filter deltas, quantiser deltas
+  (uncompressed header parse) and the full
+  V4L2_CID_STATELESS_VP9_COMPRESSED_HDR probability updates (VPX
+  boolean decoder), needed by rkvdec.
+- AV1: refresh_frame_flags via one-frame deferred submission (see above);
+  per-reference order hints are tracked driver-side per surface.
+
+
+Known limitations
+-----------------
+
+- Decode (VAEntrypointVLD) and video processing (VAEntrypointVideoProc,
+  rotation/mirroring/scaling blits only), no encode, no subpictures, no
+  vaPutSurface display path.
+- Streams that decode to a format with no VA representation are refused
+  unless the hardware converter can handle them (see above).
+- H.264 pic_order_cnt_type == 1 streams: VA-API does not transport the
+  SPS offset_for_ref_frame table.
+- H.264 PPS num_ref_idx_l*_default_active is taken from the first
+  non-IDR P/B slice that does not override the counts (VA-API does not
+  carry the real PPS defaults); only relevant for frame-based decoders
+  that parse slice headers in hardware (rkvdec).
+- HEVC entry point offsets are not passed (libva has no usable subsets
+  buffer definition); purely a WPP performance hint for Hantro G2.
+- HEVC on decoders that require the full SPS reference picture set
+  tables (Rockchip rkvdec2/vdpu38x EXT_SPS_ST_RPS controls) is declined:
+  VA-API never exposes the SPS st_ref_pic_set() syntax, so these devices
+  cannot be driven correctly over VA-API at all.
+- Tiled/compressed CAPTURE formats can be exported as dma-bufs but not
+  read back with vaGetImage() (no CPU detiling).
+
+
+License
+-------
+
+GPL-3.0-or-later, see COPYING.
+
+Copyright (C) 2026 Ondrej Jirman <megi@xff.cz>

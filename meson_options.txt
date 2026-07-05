@@ -1,0 +1,2 @@
+option('driverdir', type: 'string', value: '',
+       description: 'libva driver installation directory (defaults to the libva pkg-config driverdir)')

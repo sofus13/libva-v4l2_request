@@ -1,0 +1,217 @@
+From 00a16f1f3a395c6cb526a82fc3f6a1012fb5f18c Mon Sep 17 00:00:00 2001
+From: Ondrej Jirman <megi@xff.cz>
+Date: Thu, 9 Jul 2026 23:46:51 +0200
+Subject: [PATCH] media: rockchip: rga: Add support for downconverting from
+ NV15 to NV12
+
+This helps with implementation of libva based driver for video decoding
+of HEVC 10bit videos on RK3399 where decoder produces NV15 pixel format
+but nothing in the existing userspace display chain can consume it
+without patches. So we use RGA2 to quickly downconvert to NV12 which is
+supported.
+
+Signed-of-by: Ondrej Jirman <megi@xff.cz>
+---
+ drivers/media/platform/rockchip/rga/rga-buf.c | 19 +++++++---
+ drivers/media/platform/rockchip/rga/rga-hw.c  | 22 ++++++++++++
+ drivers/media/platform/rockchip/rga/rga-hw.h  | 13 +++++--
+ drivers/media/platform/rockchip/rga/rga.c     | 36 +++++++++++++++----
+ drivers/media/platform/rockchip/rga/rga.h     |  2 ++
+ 5 files changed, 80 insertions(+), 12 deletions(-)
+
+diff --git a/drivers/media/platform/rockchip/rga/rga-buf.c b/drivers/media/platform/rockchip/rga/rga-buf.c
+index bb575873f2b2..26e1cd368223 100644
+--- a/drivers/media/platform/rockchip/rga/rga-buf.c
++++ b/drivers/media/platform/rockchip/rga/rga-buf.c
+@@ -26,8 +26,13 @@ static ssize_t fill_descriptors(struct rga_dma_desc *desc, size_t max_desc,
+ 	dma_addr_t addr;
+ 
+ 	for_each_sgtable_dma_page(sgt, &iter, 0) {
+-		if (n_desc > max_desc)
+-			return -EINVAL;
++		/*
++		 * Imported buffers may be larger than the frame (decoders
++		 * append auxiliary data after the image); only the frame
++		 * itself is mapped for the RGA.
++		 */
++		if (n_desc >= max_desc)
++			break;
+ 		addr = sg_page_iter_dma_address(&iter);
+ 		tmp->addr = lower_32_bits(addr);
+ 		tmp++;
+@@ -97,12 +102,18 @@ static int rga_buf_init(struct vb2_buffer *vb)
+ 
+ static int get_plane_offset(struct rga_frame *f, int plane)
+ {
++	/*
++	 * Derive the offsets from the line stride rather than the width:
++	 * for packed 10-bit formats (NV15) a line covers more bytes than
++	 * there are pixels. For all 8-bit YUV formats stride == width, so
++	 * this is equivalent.
++	 */
+ 	if (plane == 0)
+ 		return 0;
+ 	if (plane == 1)
+-		return f->width * f->height;
++		return f->stride * f->height;
+ 	if (plane == 2)
+-		return f->width * f->height + (f->width * f->height / f->fmt->uv_factor);
++		return f->stride * f->height + (f->stride * f->height / f->fmt->uv_factor);
+ 
+ 	return -EINVAL;
+ }
+diff --git a/drivers/media/platform/rockchip/rga/rga-hw.c b/drivers/media/platform/rockchip/rga/rga-hw.c
+index 43ed742a1649..15f4a204a1fa 100644
+--- a/drivers/media/platform/rockchip/rga/rga-hw.c
++++ b/drivers/media/platform/rockchip/rga/rga-hw.c
+@@ -184,6 +184,15 @@ static void rga_cmd_set_trans_info(struct rga_ctx *ctx)
+ 	dst_info.data.format = ctx->out.fmt->hw_format;
+ 	dst_info.data.swap = ctx->out.fmt->color_swap;
+ 
++	/*
++	 * Packed 10-bit YUV source: the destination path is always 8-bit,
++	 * so also enable rounding of the two dropped bits.
++	 */
++	if (ctx->in.fmt->yuv10) {
++		src_info.data.yuv10_e = 1;
++		src_info.data.yuv10_round_e = 1;
++	}
++
+ 	/*
+ 	 * CSC mode must only be set when the colorspace families differ between
+ 	 * input and output. It must remain unset (zeroed) if both are the same.
+@@ -282,6 +291,19 @@ static void rga_cmd_set_trans_info(struct rga_ctx *ctx)
+ 			rga_get_scaling(src_h - 1, scale_dst_h - 1);
+ 	}
+ 
++	/*
++	 * The 10-bit direct fetch path mis-addresses every other 128-pixel
++	 * tile (it steps by the 8-bit tile size within each 256-pixel pair);
++	 * route unscaled 10-bit blits through the scaler at 1:1 instead,
++	 * like the vendor driver does.
++	 */
++	if (ctx->in.fmt->yuv10 && !ctx->rotate && !ctx->hflip && !ctx->vflip) {
++		if (src_info.data.hscl_mode == RGA_SRC_HSCL_MODE_NO)
++			src_info.data.hscl_mode = RGA_SRC_HSCL_MODE_BYPASS;
++		if (src_info.data.vscl_mode == RGA_SRC_VSCL_MODE_NO)
++			src_info.data.vscl_mode = RGA_SRC_VSCL_MODE_BYPASS;
++	}
++
+ 	/*
+ 	 * Calculate the framebuffer virtual strides and active size,
+ 	 * note that the step of vir_stride / vir_width is 4 byte words
+diff --git a/drivers/media/platform/rockchip/rga/rga-hw.h b/drivers/media/platform/rockchip/rga/rga-hw.h
+index cc6bd7f5b030..1f617b03a5b1 100644
+--- a/drivers/media/platform/rockchip/rga/rga-hw.h
++++ b/drivers/media/platform/rockchip/rga/rga-hw.h
+@@ -124,10 +124,15 @@
+ #define RGA_SRC_HSCL_MODE_NO 0
+ #define RGA_SRC_HSCL_MODE_DOWN 1
+ #define RGA_SRC_HSCL_MODE_UP 2
++/* Undocumented: routes the fetch through the scaler at 1:1 (zero factors).
++ * Required for 10-bit sources, whose direct fetch path mis-addresses every
++ * other 128-pixel tile; matches the vendor driver's 10-bit handling. */
++#define RGA_SRC_HSCL_MODE_BYPASS 3
+ 
+ #define RGA_SRC_VSCL_MODE_NO 0
+ #define RGA_SRC_VSCL_MODE_DOWN 1
+ #define RGA_SRC_VSCL_MODE_UP 2
++#define RGA_SRC_VSCL_MODE_BYPASS 3
+ 
+ #define RGA_SRC_TRANS_ENABLE_R 1
+ #define RGA_SRC_TRANS_ENABLE_G 2
+@@ -214,8 +219,12 @@ union rga_src_info {
+ 		/* [23:25] */
+ 		unsigned int dither_up_en:1;
+ 		unsigned int bic_coe_sel:2;
+-		/* [26:31] */
+-		unsigned int reserved:6;
++		/* [26:28] */
++		unsigned int vsp_mode:1;
++		unsigned int yuv10_e:1;
++		unsigned int yuv10_round_e:1;
++		/* [29:31] */
++		unsigned int reserved:3;
+ 	} data;
+ };
+ 
+diff --git a/drivers/media/platform/rockchip/rga/rga.c b/drivers/media/platform/rockchip/rga/rga.c
+index fea63b94c5f3..82b60c1734b6 100644
+--- a/drivers/media/platform/rockchip/rga/rga.c
++++ b/drivers/media/platform/rockchip/rga/rga.c
+@@ -293,6 +293,18 @@ static struct rga_fmt formats[] = {
+ 		.y_div = 2,
+ 		.x_div = 1,
+ 	},
++	{
++		/* Packed 10-bit YUV420SP, source only (10-bit output is not
++		 * supported by the hardware). */
++		.fourcc = V4L2_PIX_FMT_NV15,
++		.color_swap = RGA_COLOR_NONE_SWAP,
++		.hw_format = RGA_COLOR_FMT_YUV420SP,
++		.depth = 15,
++		.uv_factor = 4,
++		.y_div = 2,
++		.x_div = 1,
++		.yuv10 = 1,
++	},
+ 	{
+ 		.fourcc = V4L2_PIX_FMT_NV16,
+ 		.color_swap = RGA_COLOR_NONE_SWAP,
+@@ -448,15 +460,23 @@ vidioc_querycap(struct file *file, void *priv, struct v4l2_capability *cap)
+ 
+ static int vidioc_enum_fmt(struct file *file, void *priv, struct v4l2_fmtdesc *f)
+ {
+-	struct rga_fmt *fmt;
++	unsigned int index = 0;
++	unsigned int i;
+ 
+-	if (f->index >= NUM_FORMATS)
+-		return -EINVAL;
++	for (i = 0; i < NUM_FORMATS; i++) {
++		/* 10-bit formats can only be read, not written. */
++		if (formats[i].yuv10 && V4L2_TYPE_IS_CAPTURE(f->type))
++			continue;
+ 
+-	fmt = &formats[f->index];
+-	f->pixelformat = fmt->fourcc;
++		if (index == f->index) {
++			f->pixelformat = formats[i].fourcc;
++			return 0;
++		}
+ 
+-	return 0;
++		index++;
++	}
++
++	return -EINVAL;
+ }
+ 
+ static int vidioc_g_fmt(struct file *file, void *priv, struct v4l2_format *f)
+@@ -486,6 +506,10 @@ static int vidioc_try_fmt(struct file *file, void *priv, struct v4l2_format *f)
+ 	if (!fmt)
+ 		fmt = &formats[0];
+ 
++	/* 10-bit formats can only be read, not written. */
++	if (fmt->yuv10 && V4L2_TYPE_IS_CAPTURE(f->type))
++		fmt = &formats[0];
++
+ 	pix_fmt->width = clamp(pix_fmt->width,
+ 			       (u32)MIN_WIDTH, (u32)MAX_WIDTH);
+ 	pix_fmt->height = clamp(pix_fmt->height,
+diff --git a/drivers/media/platform/rockchip/rga/rga.h b/drivers/media/platform/rockchip/rga/rga.h
+index 72a28b120fab..72859e4541c1 100644
+--- a/drivers/media/platform/rockchip/rga/rga.h
++++ b/drivers/media/platform/rockchip/rga/rga.h
+@@ -21,6 +21,8 @@ struct rga_fmt {
+ 	u8 x_div;
+ 	u8 color_swap;
+ 	u8 hw_format;
++	/* Packed 10-bit YUV, readable by the source channel only. */
++	u8 yuv10;
+ };
+ 
+ struct rga_frame {
+-- 
+2.54.0
+
