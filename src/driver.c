@@ -18,6 +18,7 @@
 
 #include <linux/media.h>
 #include <linux/videodev2.h>
+#include <linux/v4l2-controls.h>
 
 #include <drm_fourcc.h>
 
@@ -204,6 +205,75 @@ static int devnode_from_devnum(uint32_t major, uint32_t minor, char *path,
 	return ret;
 }
 
+/*
+ * Ask the device whether it can decode 10-bit HEVC. There is no V4L2 query for
+ * this and the raw CAPTURE formats do not distinguish 8- from 10-bit, so mirror
+ * what the decode path does: select the HEVC coded format on the OUTPUT queue,
+ * then set a 10-bit HEVC SPS with VIDIOC_S_EXT_CTRLS (no request). Devices that
+ * cannot do 10-bit reject the bit depth in try_ctrl with EINVAL (e.g. cedrus on
+ * the A64); capable devices accept it.
+ *
+ * Selecting the coded format first matters: drivers dispatch control validation
+ * per selected codec, and some (rkvdec) additionally reject an SPS whose picture
+ * size exceeds the current OUTPUT format — so the SPS is sized to the dimensions
+ * the device just accepted for the coded format.
+ */
+static bool video_device_probe_hevc_10bit(int fd, uint32_t output_type)
+{
+#if HAVE_V4L2_CTRL_HEVC
+	bool mplane = V4L2_TYPE_IS_MULTIPLANAR(output_type);
+	struct v4l2_format format = { .type = output_type };
+	struct v4l2_ctrl_hevc_sps sps = {
+		.chroma_format_idc = 1,
+		.bit_depth_luma_minus8 = 2,
+		.bit_depth_chroma_minus8 = 2,
+		.log2_max_pic_order_cnt_lsb_minus4 = 4,
+		.log2_diff_max_min_luma_coding_block_size = 3,
+		.log2_diff_max_min_luma_transform_block_size = 3,
+		.sps_max_dec_pic_buffering_minus1 = 4,
+	};
+	struct v4l2_ext_control control = {
+		.id = V4L2_CID_STATELESS_HEVC_SPS,
+		.ptr = &sps,
+		.size = sizeof(sps),
+	};
+	struct v4l2_ext_controls controls = {
+		.count = 1,
+		.controls = &control,
+	};
+
+	if (mplane) {
+		format.fmt.pix_mp.width = 1920;
+		format.fmt.pix_mp.height = 1088;
+		format.fmt.pix_mp.pixelformat = V4L2_PIX_FMT_HEVC_SLICE;
+		format.fmt.pix_mp.num_planes = 1;
+	} else {
+		format.fmt.pix.width = 1920;
+		format.fmt.pix.height = 1088;
+		format.fmt.pix.pixelformat = V4L2_PIX_FMT_HEVC_SLICE;
+	}
+
+	if (ioctl(fd, VIDIOC_S_FMT, &format) < 0)
+		return false;
+
+	/* Size the SPS to what the device accepted; some drivers reject an SPS
+	 * larger than the current OUTPUT format. */
+	if (mplane) {
+		sps.pic_width_in_luma_samples = format.fmt.pix_mp.width;
+		sps.pic_height_in_luma_samples = format.fmt.pix_mp.height;
+	} else {
+		sps.pic_width_in_luma_samples = format.fmt.pix.width;
+		sps.pic_height_in_luma_samples = format.fmt.pix.height;
+	}
+
+	return ioctl(fd, VIDIOC_S_EXT_CTRLS, &controls) == 0;
+#else
+	(void)fd;
+	(void)output_type;
+	return false;
+#endif
+}
+
 static bool video_device_is_request_decoder(const char *path,
 					    struct v4l2r_decoder *decoder)
 {
@@ -252,6 +322,15 @@ static bool video_device_is_request_decoder(const char *path,
 		decoder->pixelformats[decoder->nb_pixelformats++] =
 			fmtdesc.pixelformat;
 		fmtdesc.index++;
+	}
+
+	decoder->hevc_10bit = false;
+	for (unsigned int i = 0; i < decoder->nb_pixelformats; i++) {
+		if (decoder->pixelformats[i] == V4L2_PIX_FMT_HEVC_SLICE) {
+			decoder->hevc_10bit =
+				video_device_probe_hevc_10bit(fd, output_type);
+			break;
+		}
 	}
 
 	close(fd);
@@ -483,6 +562,36 @@ static bool driver_supports_pixelformat(struct v4l2r_driver *drv,
 	return false;
 }
 
+/* Whether some decoder can decode 10-bit HEVC. */
+static bool driver_supports_hevc_10bit(struct v4l2r_driver *drv)
+{
+	for (unsigned int i = 0; i < drv->nb_decoders; i++) {
+		if (drv->decoders[i].hevc_10bit)
+			return true;
+	}
+
+	return false;
+}
+
+/*
+ * Whether a decode profile is usable: some decoder must accept the codec's
+ * coded format, and for 10-bit profiles the hardware must actually support the
+ * higher bit depth (advertising Main10 on an 8-bit-only decoder would make
+ * clients pick VA-API and then fail every frame at decode time).
+ */
+static bool driver_supports_profile(struct v4l2r_driver *drv, VAProfile profile)
+{
+	const struct v4l2r_codec *codec = v4l2r_codec_for_profile(profile);
+
+	if (!codec || !driver_supports_pixelformat(drv, codec->pixelformat))
+		return false;
+
+	if (profile == VAProfileHEVCMain10 && !driver_supports_hevc_10bit(drv))
+		return false;
+
+	return true;
+}
+
 /* --- config --- */
 
 VAStatus v4l2r_QueryConfigProfiles(VADriverContextP va_ctx, VAProfile *profiles,
@@ -500,6 +609,8 @@ VAStatus v4l2r_QueryConfigProfiles(VADriverContextP va_ctx, VAProfile *profiles,
 			continue;
 
 		for (unsigned int j = 0; j < list[i]->nb_profiles; j++) {
+			if (!driver_supports_profile(drv, list[i]->profiles[j]))
+				continue;
 			if (count < V4L2R_MAX_PROFILES)
 				profiles[count++] = list[i]->profiles[j];
 		}
@@ -529,7 +640,7 @@ VAStatus v4l2r_QueryConfigEntrypoints(VADriverContextP va_ctx, VAProfile profile
 		if (v4l2r_converter_available(drv))
 			entrypoints[(*num_entrypoints)++] =
 				VAEntrypointVideoProc;
-	} else if (codec && driver_supports_pixelformat(drv, codec->pixelformat)) {
+	} else if (codec && driver_supports_profile(drv, profile)) {
 		entrypoints[0] = VAEntrypointVLD;
 		*num_entrypoints = 1;
 	} else {
@@ -556,8 +667,7 @@ VAStatus v4l2r_CreateConfig(VADriverContextP va_ctx, VAProfile profile,
 			return VA_STATUS_ERROR_UNSUPPORTED_ENTRYPOINT;
 	} else {
 		codec = v4l2r_codec_for_profile(profile);
-		if (!codec ||
-		    !driver_supports_pixelformat(drv, codec->pixelformat))
+		if (!codec || !driver_supports_profile(drv, profile))
 			return VA_STATUS_ERROR_UNSUPPORTED_PROFILE;
 
 		if (entrypoint != VAEntrypointVLD)

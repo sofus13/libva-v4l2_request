@@ -80,6 +80,10 @@ struct v4l2r_decoder {
 	char card[32];
 	uint32_t pixelformats[V4L2R_MAX_PIXELFORMATS];
 	unsigned int nb_pixelformats;
+	/* Whether this decoder accepts a 10-bit HEVC SPS. Not every HEVC-capable
+	 * device can do 10-bit (e.g. Allwinner A64 lacks it), and the kernel only
+	 * rejects it at decode time, so probe it up front and gate Main10. */
+	bool hevc_10bit;
 };
 
 /*
