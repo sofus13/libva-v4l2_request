@@ -314,6 +314,36 @@ static VAStatus backing_alloc(struct v4l2r_driver *drv,
 			       capability.device_caps : capability.capabilities;
 		mplane = capabilities & V4L2_CAP_VIDEO_M2M_MPLANE;
 
+		/*
+		 * Stateless decoders derive the CAPTURE geometry from the
+		 * coded OUTPUT format and ignore the dimensions passed to
+		 * S_FMT(CAPTURE) (e.g. cedrus clamps CAPTURE to the OUTPUT
+		 * size, 16x16 on a freshly opened fd). Set a coded OUTPUT
+		 * format at the wanted size first so the CAPTURE queue reports
+		 * the resolution we actually asked for.
+		 */
+		struct v4l2_format out = {
+			.type = mplane ?
+				V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE :
+				V4L2_BUF_TYPE_VIDEO_OUTPUT,
+		};
+		uint32_t coded = drv->decoders[n].nb_pixelformats ?
+				 drv->decoders[n].pixelformats[0] : 0;
+
+		if (mplane) {
+			out.fmt.pix_mp.width = width;
+			out.fmt.pix_mp.height = height;
+			out.fmt.pix_mp.pixelformat = coded;
+			out.fmt.pix_mp.num_planes = 1;
+		} else {
+			out.fmt.pix.width = width;
+			out.fmt.pix.height = height;
+			out.fmt.pix.pixelformat = coded;
+		}
+
+		if (coded && ioctl(fd, VIDIOC_S_FMT, &out) < 0)
+			goto next;
+
 		format.type = mplane ? V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE :
 				       V4L2_BUF_TYPE_VIDEO_CAPTURE;
 		if (mplane) {
