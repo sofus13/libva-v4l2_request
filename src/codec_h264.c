@@ -244,8 +244,11 @@ static void h264_parse_slice_header(struct h264_context *codec,
 		}
 	}
 
-	/* Bit size of the slice header, without the NAL header byte. */
-	info->header_bit_size = b.pos - 8;
+	/* Offset in bits to slice_data() from the start of the slice NAL unit,
+	 * i.e. including the NAL header byte. cedrus (and the V4L2 interface)
+	 * count header_bit_size from bit 0 of the submitted slice buffer, which
+	 * begins at the NAL header byte, so this must not exclude it. */
+	info->header_bit_size = b.pos;
 	info->valid = !b.error;
 }
 
@@ -482,13 +485,12 @@ static void h264_fill_slice_params(struct v4l2r_context *ctx,
 	struct v4l2_ctrl_h264_pred_weights *weights = &codec->pred_weights;
 
 	*slice = (struct v4l2_ctrl_h264_slice_params) {
-		/* On a parse failure fall back to the VA bit offset (which counts
-		 * the NAL header byte, hence the -8); guard the subtraction so a
-		 * bogus sub-8 offset cannot underflow. */
+		/* On a parse failure fall back to the VA bit offset, which is
+		 * already the offset to slice_data() from the start of the slice
+		 * NAL unit (including the NAL header byte) — the same quantity
+		 * header_bit_size carries. */
 		.header_bit_size = info->valid ? info->header_bit_size :
-				   (va_slice->slice_data_bit_offset >= 8 ?
-				    (uint32_t)va_slice->slice_data_bit_offset - 8u :
-				    0u),
+				   va_slice->slice_data_bit_offset,
 		.first_mb_in_slice = va_slice->first_mb_in_slice,
 		.slice_type = va_slice->slice_type % 5,
 		.redundant_pic_cnt = info->redundant_pic_cnt,
