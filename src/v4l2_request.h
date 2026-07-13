@@ -55,6 +55,9 @@
  * count plus the pipeline depth, so keep headroom up to the 64-bit bitmask. */
 #define V4L2R_MAX_CAPTURE_BUFFERS	64
 
+/* Upper bound on any single wait for the hardware (buffer/request/fence). */
+#define V4L2R_POLL_TIMEOUT_MS		2000
+
 /* In-flight job slots on the format converter, per decode context. */
 #define V4L2R_CONVERT_SLOTS		4
 

@@ -23,7 +23,6 @@
 
 #include "v4l2_request.h"
 
-#define V4L2R_POLL_TIMEOUT_MS	2000
 /* Room kept at the tail of the OUTPUT buffer, zeroed before submission. */
 #define V4L2R_BITSTREAM_PADDING	64
 

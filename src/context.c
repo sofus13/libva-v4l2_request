@@ -13,6 +13,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <poll.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
@@ -418,6 +419,28 @@ static int capture_buffer_new(struct v4l2r_context *ctx)
 }
 
 /*
+ * Wait for external consumers of the buffer's exported dma-buf(s) to finish
+ * reading. POLLOUT on a dma-buf completes only once all fences on its
+ * reservation object have signalled, which for an imported buffer includes the
+ * read fence a GPU attaches while sampling it. Buffers that were never exported
+ * carry fd == -1 and are skipped.
+ */
+static void capture_wait_readers(struct v4l2r_capture_buffer *capture)
+{
+	for (unsigned int i = 0; i < capture->nb_planes; i++) {
+		struct pollfd pfd = {
+			.fd = capture->dmabuf_fd[i],
+			.events = POLLOUT,
+		};
+
+		if (capture->dmabuf_fd[i] < 0)
+			continue;
+
+		poll(&pfd, 1, V4L2R_POLL_TIMEOUT_MS);
+	}
+}
+
+/*
  * Ensure the surface has a CAPTURE buffer and that the buffer is safe to
  * decode into now. A surface keeps the same buffer for its whole lifetime -
  * so vaExportSurfaceHandle() is stable per VASurfaceID - and the buffer is
@@ -460,6 +483,18 @@ static int capture_buffer_bind(struct v4l2r_context *ctx,
 	v4l2r_sync_capture(ctx, index);
 	v4l2r_wait_completed(ctx, ctx->captures[index].last_ref_seq);
 	v4l2r_convert_drain_index(ctx, index);
+
+	/*
+	 * The decoder writes into this buffer and the kernel offers no implicit
+	 * synchronisation against an external consumer of the exported dma-buf.
+	 * When a GPU is sampling it (e.g. mpv --vo=gpu importing the dma-buf as
+	 * an EGL image), reuse would race the decode against the still in-flight
+	 * read and tear the picture. POLLOUT on a dma-buf blocks until every
+	 * fence on its reservation - including the GPU's read fence - signals, so
+	 * wait for readers to finish before handing the buffer back to decode.
+	 * No-op for a buffer never exported (fd < 0) or already idle.
+	 */
+	capture_wait_readers(&ctx->captures[index]);
 
 	return 0;
 }
