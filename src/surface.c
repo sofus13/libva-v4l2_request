@@ -55,6 +55,7 @@ VAStatus v4l2r_CreateSurfaces2(VADriverContextP va_ctx, unsigned int format,
 		if (!surface)
 			goto fail;
 
+		surface->id = id;
 		surface->width = width;
 		surface->height = height;
 		surface->rt_format = format;
@@ -246,7 +247,11 @@ VAStatus v4l2r_surface_ready(struct v4l2r_surface *surface)
 	if (!surface->ctx || surface->capture_index < 0)
 		return VA_STATUS_SUCCESS;
 
+	uint64_t t0 = v4l2r_now_ns();
 	status = v4l2r_sync_capture(surface->ctx, surface->capture_index);
+	v4l2r_trace("export sync (surface 0x%08x buf #%d): %.2f ms\n",
+		    surface->id, surface->capture_index,
+		    (v4l2r_now_ns() - t0) / 1e6);
 	if (status != VA_STATUS_SUCCESS)
 		return status;
 

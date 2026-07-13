@@ -89,6 +89,15 @@ int v4l2r_query_control_default(struct v4l2r_context *ctx, uint32_t id,
 
 /* --- queue/dequeue primitives, ctx->mutex must be held --- */
 
+/* VA id of the surface bound to a CAPTURE buffer, or VA_INVALID_ID. */
+static uint32_t capture_surface_id(struct v4l2r_context *ctx, uint32_t index)
+{
+	if (index < ctx->nb_captures && ctx->captures[index].surface)
+		return ctx->captures[index].surface->id;
+
+	return VA_INVALID_ID;
+}
+
 static int queue_buffer(struct v4l2r_context *ctx, struct v4l2_buffer *buffer)
 {
 	struct v4l2_plane planes[VIDEO_MAX_PLANES] = {0};
@@ -105,6 +114,9 @@ static int queue_buffer(struct v4l2r_context *ctx, struct v4l2_buffer *buffer)
 
 	if (V4L2_TYPE_IS_OUTPUT(buffer->type)) {
 		ctx->queued_output |= 1u << buffer->index;
+		v4l2r_trace("QBUF OUTPUT  #%u -> CAPTURE #%d (request %d)\n",
+			  buffer->index, (int)buffer->timestamp.tv_usec - 1,
+			  buffer->request_fd);
 	} else {
 		ctx->queued_capture |= UINT64_C(1) << buffer->index;
 		/* Count decode submissions on the CAPTURE queue: one per frame,
@@ -112,6 +124,11 @@ static int queue_buffer(struct v4l2r_context *ctx, struct v4l2_buffer *buffer)
 		 * reads) actually finishes, unlike the OUTPUT bitstream buffer
 		 * which is released as soon as it is consumed. */
 		ctx->submitted++;
+		v4l2r_trace("QBUF CAPTURE #%u (surface 0x%08x), submit #%llu, "
+			  "%u in flight\n", buffer->index,
+			  capture_surface_id(ctx, buffer->index),
+			  (unsigned long long)ctx->submitted,
+			  __builtin_popcountll(ctx->queued_capture));
 	}
 
 	return 0;
@@ -163,9 +180,16 @@ static int dequeue_buffer(struct v4l2r_context *ctx, enum v4l2_buf_type type)
 
 	if (V4L2_TYPE_IS_OUTPUT(type)) {
 		ctx->queued_output &= ~(1u << buffer.index);
+		v4l2r_trace("DQBUF OUTPUT  #%u (bitstream consumed)\n",
+			  buffer.index);
 	} else {
 		ctx->queued_capture &= ~(UINT64_C(1) << buffer.index);
 		ctx->completed++;
+		v4l2r_trace("DQBUF CAPTURE #%u (surface 0x%08x) decode done, "
+			  "completed #%llu, %u still in flight\n", buffer.index,
+			  capture_surface_id(ctx, buffer.index),
+			  (unsigned long long)ctx->completed,
+			  __builtin_popcountll(ctx->queued_capture));
 		if (buffer.index < ctx->nb_captures &&
 		    ctx->captures[buffer.index].surface) {
 			ctx->captures[buffer.index].surface->status =

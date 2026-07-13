@@ -14,6 +14,7 @@
 #include <sys/ioctl.h>
 #include <sys/stat.h>
 #include <sys/sysmacros.h>
+#include <time.h>
 #include <unistd.h>
 
 #include <linux/media.h>
@@ -35,6 +36,38 @@ void v4l2r_log(const char *fmt, ...)
 	va_start(args, fmt);
 	vfprintf(stderr, fmt, args);
 	va_end(args);
+}
+
+/*
+ * Verbose per-buffer lifecycle tracing, off unless LIBVA_V4L2_TRACE is set.
+ * Each line is prefixed with a CLOCK_MONOTONIC timestamp (seconds.nanoseconds,
+ * same clock as the libva LIBVA_TRACE logs) and built in one buffer so lines
+ * from the decode and VO threads stay intact and orderable.
+ */
+void v4l2r_trace(const char *fmt, ...)
+{
+	static int enabled = -1;
+	struct timespec ts;
+	char buf[512];
+	va_list args;
+	int n;
+
+	if (enabled < 0)
+		enabled = getenv("LIBVA_V4L2_TRACE") != NULL;
+	if (!enabled)
+		return;
+
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	n = snprintf(buf, sizeof(buf), "[%lld.%09ld] libva-v4l2request: ",
+		     (long long)ts.tv_sec, ts.tv_nsec);
+	if (n < 0 || (size_t)n >= sizeof(buf))
+		return;
+
+	va_start(args, fmt);
+	vsnprintf(buf + n, sizeof(buf) - n, fmt, args);
+	va_end(args);
+
+	fputs(buf, stderr);
 }
 
 /* --- codec and format tables --- */

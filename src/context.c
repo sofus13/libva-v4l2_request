@@ -259,6 +259,9 @@ static int output_buffer_setup(struct v4l2r_context *ctx,
 		return -errno;
 	}
 
+	v4l2r_trace("allocated OUTPUT buffer #%u (%u bytes)\n",
+		  output->index, output->size);
+
 	return 0;
 }
 
@@ -357,6 +360,21 @@ static int free_list_pop(struct v4l2r_context *ctx)
 	return index;
 }
 
+/* Per-CAPTURE-buffer size implied by the negotiated format, in bytes. */
+static size_t capture_format_bytes(const struct v4l2_format *fmt)
+{
+	size_t bytes = 0;
+
+	if (V4L2_TYPE_IS_MULTIPLANAR(fmt->type)) {
+		for (unsigned int i = 0; i < fmt->fmt.pix_mp.num_planes; i++)
+			bytes += fmt->fmt.pix_mp.plane_fmt[i].sizeimage;
+	} else {
+		bytes = fmt->fmt.pix.sizeimage;
+	}
+
+	return bytes;
+}
+
 /* Allocate one new CAPTURE buffer, returning its index (unbound). */
 static int capture_buffer_new(struct v4l2r_context *ctx)
 {
@@ -368,12 +386,22 @@ static int capture_buffer_new(struct v4l2r_context *ctx)
 	struct v4l2_plane planes[VIDEO_MAX_PLANES] = {0};
 	struct v4l2_buffer buffer = {0};
 	struct v4l2r_capture_buffer *capture;
+	size_t bufsize = capture_format_bytes(&ctx->capture_format);
 
-	if (ctx->nb_captures >= V4L2R_MAX_CAPTURE_BUFFERS)
+	if (ctx->nb_captures >= V4L2R_MAX_CAPTURE_BUFFERS) {
+		v4l2r_log("CAPTURE buffer limit reached (%u buffers, ~%llu MiB); "
+			  "refusing to allocate more\n", ctx->nb_captures,
+			  (unsigned long long)((uint64_t)ctx->nb_captures *
+					       bufsize >> 20));
 		return -ENOSPC;
+	}
 
 	if (ioctl(ctx->video_fd, VIDIOC_CREATE_BUFS, &buffers) < 0) {
-		v4l2r_log("failed to create CAPTURE buffer: %s\n",
+		v4l2r_log("failed to allocate CAPTURE buffer #%u (%zu bytes; "
+			  "already %u buffers ~%llu MiB allocated): %s\n",
+			  ctx->nb_captures, bufsize, ctx->nb_captures,
+			  (unsigned long long)((uint64_t)ctx->nb_captures *
+					       bufsize >> 20),
 			  strerror(errno));
 		return -errno;
 	}
@@ -414,6 +442,17 @@ static int capture_buffer_new(struct v4l2r_context *ctx)
 
 	if (buffer.index >= ctx->nb_captures)
 		ctx->nb_captures = buffer.index + 1;
+
+	{
+		size_t got = 0;
+		for (unsigned int i = 0; i < capture->nb_planes; i++)
+			got += capture->plane_size[i];
+		v4l2r_trace("allocated CAPTURE buffer #%u (%zu bytes); "
+			  "%u buffers, ~%llu MiB total\n", buffer.index, got,
+			  ctx->nb_captures,
+			  (unsigned long long)((uint64_t)ctx->nb_captures *
+					       got >> 20));
+	}
 
 	return buffer.index;
 }
@@ -465,8 +504,11 @@ static int capture_buffer_bind(struct v4l2r_context *ctx,
 	if (index < 0) {
 		/* First decode into this surface: recycle a buffer orphaned by
 		 * a destroyed surface, or grow the pool. */
+		bool recycled = true;
+
 		index = free_list_pop(ctx);
 		if (index < 0) {
+			recycled = false;
 			index = capture_buffer_new(ctx);
 			if (index < 0)
 				return index;
@@ -475,13 +517,19 @@ static int capture_buffer_bind(struct v4l2r_context *ctx,
 		ctx->captures[index].surface = surface;
 		surface->ctx = ctx;
 		surface->capture_index = index;
+
+		v4l2r_trace("bind surface 0x%08x -> CAPTURE buffer #%d (%s)\n",
+			  surface->id, index, recycled ? "recycled" : "new");
 	}
 
 	/* Do not overwrite the buffer while its own last decode is in flight,
 	 * while any frame still references its current contents, or while
 	 * the format converter is still reading it. */
+	uint64_t t0 = v4l2r_now_ns();
 	v4l2r_sync_capture(ctx, index);
+	uint64_t t1 = v4l2r_now_ns();
 	v4l2r_wait_completed(ctx, ctx->captures[index].last_ref_seq);
+	uint64_t t2 = v4l2r_now_ns();
 	v4l2r_convert_drain_index(ctx, index);
 
 	/*
@@ -495,6 +543,11 @@ static int capture_buffer_bind(struct v4l2r_context *ctx,
 	 * No-op for a buffer never exported (fd < 0) or already idle.
 	 */
 	capture_wait_readers(&ctx->captures[index]);
+	uint64_t t3 = v4l2r_now_ns();
+
+	v4l2r_trace("bind wait (surface 0x%08x buf #%d): sync %.2f refwait %.2f "
+		    "readers %.2f ms\n", surface->id, index,
+		    (t1 - t0) / 1e6, (t2 - t1) / 1e6, (t3 - t2) / 1e6);
 
 	return 0;
 }
@@ -511,6 +564,9 @@ void v4l2r_context_release_capture(struct v4l2r_context *ctx, int index)
 	/* Orphan the buffer for later recycling. It keeps its last_ref_seq so
 	 * a future decode that recycles it still waits out any frame that
 	 * referenced its contents. */
+	v4l2r_trace("release surface 0x%08x, orphan CAPTURE buffer #%d "
+		  "(free list now %u)\n",
+		  ctx->captures[index].surface->id, index, ctx->free_count + 1);
 	ctx->captures[index].surface->capture_index = -1;
 	ctx->captures[index].surface = NULL;
 	free_list_push(ctx, index);

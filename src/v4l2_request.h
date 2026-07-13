@@ -30,12 +30,22 @@
 #include <pthread.h>
 #include <stdbool.h>
 #include <stdint.h>
+#include <time.h>
 
 #include <va/va.h>
 #include <va/va_backend.h>
 #include <va/va_vpp.h>
 
 #include "config.h"
+
+/* Monotonic timestamp in nanoseconds, for measuring how long waits block. */
+static inline uint64_t v4l2r_now_ns(void)
+{
+	struct timespec ts;
+
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return (uint64_t)ts.tv_sec * 1000000000ull + ts.tv_nsec;
+}
 
 #define V4L2R_MAX_PROFILES		32
 #define V4L2R_MAX_ENTRYPOINTS		4
@@ -72,6 +82,7 @@ struct v4l2r_context;
 struct v4l2r_codec;
 
 void v4l2r_log(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
+void v4l2r_trace(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 
 /*
  * One V4L2 stateless decoder found during device enumeration: the media
@@ -157,6 +168,7 @@ struct v4l2r_surface_backing {
 
 struct v4l2r_surface {
 	struct v4l2r_context *ctx;	/* context the surface is bound to */
+	VASurfaceID id;			/* own VA id, for logging/tracing */
 	unsigned int width;
 	unsigned int height;
 	unsigned int rt_format;
