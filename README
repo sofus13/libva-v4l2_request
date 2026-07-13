@@ -29,6 +29,7 @@ see "10-bit decoding and the RGA converter" below.
 Have fun,
 	~megi
 
+
 Building
 --------
 
@@ -176,6 +177,17 @@ downstream (GL sampling or the plane scaler) then only touches
 panel-sized buffers instead of 1080p ones, which more than halves the
 per-frame memory traffic on the display path - worth having on a
 phone.
+
+
+Running mpv on the Pinephone (Weston + rotation)
+------------------------------------------------
+
+This is the same as Pinephone Pro. There's a known bug in mpv that makes
+for a not so nice tint in the video, when using --vo=gpu. See:
+
+  https://github.com/mpv-player/mpv/issues/12968
+
+Just use --vo=dmabuf-wayland
 
 
 Using with Firefox
