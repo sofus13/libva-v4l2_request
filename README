@@ -241,6 +241,15 @@ Design
   have completed. This is the same guarantee FFmpeg's hwaccel gets
   structurally from its AVBufferPool refcount.
 
+- Reuse also waits on any external consumer of the buffer's exported
+  dma-buf. The kernel offers no implicit synchronisation against a
+  decode overwriting a buffer a compositor or GPU is still sampling
+  (e.g. mpv --vo=gpu holding it as an EGL image), which would tear the
+  picture. POLLOUT on an exported dma-buf completes only once every
+  fence on its reservation - including a GPU read fence - has signalled,
+  so the driver polls it before handing the buffer back to the decoder.
+  Buffers never exported carry no fd and skip this.
+
 - Multi-slice H.264/HEVC frames use V4L2_BUF_FLAG_M2M_HOLD_CAPTURE_BUF;
   H.264 queues one request per slice, HEVC batches up to the SLICE_PARAMS
   control dimension. Both honour the driver's decode mode (slice/frame
