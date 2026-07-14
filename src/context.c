@@ -764,12 +764,6 @@ VAStatus v4l2r_CreateContext(VADriverContextP va_ctx, VAConfigID config_id,
 		if (!try_framesize(ctx, ctx->codec->pixelformat))
 			goto next;
 
-		ret = query_buffer_capabilities(ctx, ctx->output_format.type,
-						&ctx->output_capabilities);
-		if (ret < 0 ||
-		    !(ctx->output_capabilities & V4L2_BUF_CAP_SUPPORTS_REQUESTS))
-			goto next;
-
 		/* Initial bitstream buffer size: compressed frames rarely
 		 * exceed a quarter of the raw size, and the buffers grow on
 		 * demand (v4l2r_output_buffer_grow) - pre-booking the raw
@@ -785,6 +779,19 @@ VAStatus v4l2r_CreateContext(VADriverContextP va_ctx, VAConfigID config_id,
 			goto next;
 
 		if (ioctl(ctx->video_fd, VIDIOC_G_FMT, &ctx->output_format) < 0)
+			goto next;
+
+		/* Query OUTPUT capabilities only now that the coded format is
+		 * set: whether the queue supports requests, and crucially whether
+		 * it supports holding the CAPTURE buffer across the slices of a
+		 * frame (V4L2_BUF_CAP_SUPPORTS_M2M_HOLD_CAPTURE_BUF), which cedrus
+		 * only reports once the OUTPUT format is a slice format. Querying
+		 * before S_FMT misses it and breaks multi-slice frames (each slice
+		 * would re-queue the same CAPTURE buffer). */
+		ret = query_buffer_capabilities(ctx, ctx->output_format.type,
+						&ctx->output_capabilities);
+		if (ret < 0 ||
+		    !(ctx->output_capabilities & V4L2_BUF_CAP_SUPPORTS_REQUESTS))
 			goto next;
 
 		ctx->media_fd = open(decoder->media_path, O_RDWR);
