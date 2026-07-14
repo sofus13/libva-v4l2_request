@@ -1,3 +1,18 @@
+1.2 - 2026-07-14
+================
+
+- Fix decoding of H.264 videos with multi-slice frames
+- Fix compatibility with mpv --vo=gpu (mpv returns buffers that are
+  still in use - being sampled by GPU at the time of return)
+- Add tracing code for performance analysis
+
+Tested platforms are currently: Allwinner A64, H3. Rockchip RK3399
+and RK3588. Only RK3588 comes with some VA-API imposed limitations,
+but still has working AV1 acceleration.
+
+This project is now useful enough for a wider distribution to users.
+
+
 1.1 - 2026-07-13
 ================
 
