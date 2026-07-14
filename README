@@ -189,6 +189,11 @@ for a not so nice tint in the video, when using --vo=gpu. See:
 
 Just use --vo=dmabuf-wayland
 
+See are also new patches from anarsoul that fix the tint seen with --vo=gpu
+on lima based HW (Allwinner A64, H3, etc.) in this mpv github issue:
+
+  https://github.com/mpv-player/mpv/pull/18264
+
 
 Using with Firefox
 ------------------
