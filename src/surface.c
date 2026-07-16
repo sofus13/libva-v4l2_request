@@ -208,25 +208,25 @@ VAStatus v4l2r_QuerySurfaceAttributes(VADriverContextP va_ctx, VAConfigID config
 	attrib_list[i].type = VASurfaceAttribMinWidth;
 	attrib_list[i].flags = VA_SURFACE_ATTRIB_GETTABLE;
 	attrib_list[i].value.type = VAGenericValueTypeInteger;
-	attrib_list[i].value.value.i = 32;
+	attrib_list[i].value.value.i = 1;
 	i++;
 
 	attrib_list[i].type = VASurfaceAttribMinHeight;
 	attrib_list[i].flags = VA_SURFACE_ATTRIB_GETTABLE;
 	attrib_list[i].value.type = VAGenericValueTypeInteger;
-	attrib_list[i].value.value.i = 32;
+	attrib_list[i].value.value.i = 1;
 	i++;
 
 	attrib_list[i].type = VASurfaceAttribMaxWidth;
 	attrib_list[i].flags = VA_SURFACE_ATTRIB_GETTABLE;
 	attrib_list[i].value.type = VAGenericValueTypeInteger;
-	attrib_list[i].value.value.i = 4096;
+	attrib_list[i].value.value.i = 65536;
 	i++;
 
 	attrib_list[i].type = VASurfaceAttribMaxHeight;
 	attrib_list[i].flags = VA_SURFACE_ATTRIB_GETTABLE;
 	attrib_list[i].value.type = VAGenericValueTypeInteger;
-	attrib_list[i].value.value.i = 4096;
+	attrib_list[i].value.value.i = 65536;
 	i++;
 
 	*num_attribs = i;
