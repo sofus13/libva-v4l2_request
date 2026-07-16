@@ -529,19 +529,18 @@ static void hevc_fill_pred_weights(struct v4l2_hevc_pred_weight_table *table,
 static void hevc_fill_slice_params(struct v4l2r_context *ctx,
 				   struct v4l2_ctrl_hevc_slice_params *params,
 				   const VASliceParameterBufferHEVC *slice,
-				   const struct hevc_slice_info *info,
-				   uint32_t data_byte_offset)
+				   const struct hevc_slice_info *info)
 {
 	struct hevc_context *codec = ctx->codec_priv;
 	const VAPictureParameterBufferHEVC *pic = &codec->va_pic;
 
-	uint32_t payload_bytes =
-		slice->slice_data_byte_offset <= slice->slice_data_size ?
-		slice->slice_data_size - slice->slice_data_byte_offset : 0;
+	uint32_t start_code_offset =
+		codec->start_code == V4L2_STATELESS_HEVC_START_CODE_ANNEX_B ?  3 : 0;
 
 	*params = (struct v4l2_ctrl_hevc_slice_params) {
-		.bit_size = payload_bytes * 8,
-		.data_byte_offset = data_byte_offset + slice->slice_data_byte_offset,
+		.bit_size = (slice->slice_data_size + start_code_offset) * 8,
+		.data_byte_offset = slice->slice_data_byte_offset,
+
 		.num_entry_point_offsets = 0,
 
 		.nal_unit_type = info->nal_unit_type,
@@ -665,7 +664,6 @@ static VAStatus hevc_process_slice(struct v4l2r_context *ctx,
 	struct hevc_context *codec = ctx->codec_priv;
 	const uint8_t *slice_data = data + va_slice->slice_data_offset;
 	struct hevc_slice_info info;
-	uint32_t data_byte_offset;
 	VAStatus status;
 
 	if (!codec->have_pic)
@@ -716,8 +714,6 @@ static VAStatus hevc_process_slice(struct v4l2r_context *ctx,
 			return status;
 	}
 
-	data_byte_offset = ctx->pic.output->bytesused;
-
 	status = v4l2r_append_output(ctx, slice_data, va_slice->slice_data_size);
 	if (status != VA_STATUS_SUCCESS)
 		return status;
@@ -731,7 +727,7 @@ static VAStatus hevc_process_slice(struct v4l2r_context *ctx,
 
 		hevc_fill_slice_params(ctx,
 				       &codec->slice_params[codec->num_slice_params],
-				       va_slice, &info, data_byte_offset);
+				       va_slice, &info);
 		codec->num_slice_params++;
 	}
 
