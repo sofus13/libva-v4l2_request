@@ -47,6 +47,7 @@ struct hevc_slice_info {
 	uint32_t short_term_ref_pic_set_size;
 	uint32_t long_term_ref_pic_set_size;
 	uint32_t num_delta_pocs_of_ref_rps_idx;
+	uint32_t num_entry_point_offsets; /* vaapi always sets this to 0 */
 	bool valid;
 };
 
@@ -54,6 +55,7 @@ struct hevc_context {
 	int64_t decode_mode;
 	int64_t start_code;
 	unsigned int max_slice_params;
+	unsigned int max_entry_point_offsets;
 	bool has_scaling_matrix;
 
 	VAPictureParameterBufferHEVC va_pic;
@@ -68,6 +70,11 @@ struct hevc_context {
 	struct v4l2_ctrl_hevc_slice_params *slice_params;
 	unsigned int alloc_slice_params;
 	unsigned int num_slice_params;
+
+	uint32_t *entry_point_offsets;
+	unsigned int alloc_entry_point_offsets;
+	unsigned int num_entry_point_offsets;
+	uint32_t num_pic_total_curr; /* needed for slice header */
 
 	VASliceParameterBufferHEVC *va_slices;
 	unsigned int nb_va_slices;
@@ -88,6 +95,50 @@ static unsigned int ceil_log2(unsigned int value)
 	return bits;
 }
 
+/* 7.3.6.2 Reference picture list modification syntax */
+static void ref_pic_lists_modification(struct hevc_context *codec,
+			struct v4l2r_bits *b, uint32_t num_ref_idx_l0_active_minus1,
+			uint32_t num_ref_idx_l1_active_minus1, bool slice_type_b)
+{
+	if(v4l2r_bits_bit(b)) {	/* ref_pic_list_modification_flag_l0 */
+		for (uint32_t i = 0; i <= num_ref_idx_l0_active_minus1; i++)
+			v4l2r_bits_read(b, codec->num_pic_total_curr);	/* list_entry_l0[i] */
+		if (slice_type_b &&
+				v4l2r_bits_bit(b))	/* ref_pic_list_modification_flag_l1 */
+			for (uint32_t i = 0; i <= num_ref_idx_l1_active_minus1; i++)
+				/* list_entry_l1[i] */
+				v4l2r_bits_read(b, codec->num_pic_total_curr);
+	}
+}
+
+/* generalised 7.3.6.3 Weighted prediction parameters syntax */
+static void pred_weight_table(struct v4l2r_bits *b,
+			uint32_t num_ref_idx_active_minus1,
+			uint32_t chroma_array_type)
+{
+	uint8_t luma_weight_flag[num_ref_idx_active_minus1 + 1];
+	uint8_t chroma_weight_flag[num_ref_idx_active_minus1 + 1];
+
+	for (uint32_t i = 0; i <= num_ref_idx_active_minus1; i++)
+		luma_weight_flag[i] = v4l2r_bits_bit(b);	/* luma_weight_lX_flag[i] */
+	if(chroma_array_type != 0)
+		for (uint32_t i = 0; i <= num_ref_idx_active_minus1; i++)
+			chroma_weight_flag[i] = v4l2r_bits_bit(b);	/* chroma_weight_lX_flag[i] */
+
+	for (uint32_t i = 0; i <= num_ref_idx_active_minus1; i++) {
+		if (luma_weight_flag[i]) {
+			v4l2r_bits_se(b); /* delta_luma_weight_lX[i] */
+			v4l2r_bits_se(b); /* luma_offset_lX[i] */
+		}
+		if (chroma_array_type != 0 && chroma_weight_flag[i]) {
+			for(uint32_t j = 0; j < 2; j++) {
+				v4l2r_bits_se(b); /* delta_chroma_weight_lX[i][j] */
+				v4l2r_bits_se(b); /* delta_chroma_offset_lX[i][j] */
+			}
+		}
+	}
+}
+
 /*
  * Parse the slice segment header far enough to measure the reference
  * picture set sections. The short term RPS length is cross-checked with
@@ -99,6 +150,13 @@ static void hevc_parse_slice_header(struct hevc_context *codec,
 {
 	const VAPictureParameterBufferHEVC *pic = &codec->va_pic;
 	bool first_slice_in_pic, dependent_slice = false;
+	bool slice_temporal_mvp_enabled_flag = false;
+	bool slice_sao_luma_flag = false, slice_sao_chroma_flag = false;
+	bool slice_deblocking_filter_disabled_flag = false;
+	bool collocated_from_l0_flag = false;
+	uint32_t chroma_array_type, slice_type;
+	uint32_t offset_len_minus1;
+	uint32_t num_ref_idx_l0_active_minus1 = 0, num_ref_idx_l1_active_minus1 = 0;
 	bool idr, irap;
 	struct v4l2r_bits b;
 	size_t mark;
@@ -106,6 +164,11 @@ static void hevc_parse_slice_header(struct hevc_context *codec,
 	memset(info, 0, sizeof(*info));
 
 	v4l2r_bits_init(&b, data, size, true);
+
+	if (pic->pic_fields.bits.separate_colour_plane_flag)
+		chroma_array_type = 0;
+	else
+		chroma_array_type = pic->pic_fields.bits.chroma_format_idc;
 
 	v4l2r_bits_bit(&b);				/* forbidden_zero_bit */
 	info->nal_unit_type = v4l2r_bits_read(&b, 6);
@@ -139,108 +202,199 @@ static void hevc_parse_slice_header(struct hevc_context *codec,
 		v4l2r_bits_read(&b, ceil_log2(pic_size_in_ctbs));
 	}
 
-	if (dependent_slice) {
-		/* RPS syntax only lives in independent slice segments. */
-		info->valid = !b.error;
-		return;
-	}
+	if (!dependent_slice) {
+		v4l2r_bits_skip(&b, pic->num_extra_slice_header_bits);
+		slice_type = v4l2r_bits_ue(&b);
 
-	v4l2r_bits_skip(&b, pic->num_extra_slice_header_bits);
-	v4l2r_bits_ue(&b);				/* slice_type */
+		if (pic->slice_parsing_fields.bits.output_flag_present_flag)
+			v4l2r_bits_bit(&b);
 
-	if (pic->slice_parsing_fields.bits.output_flag_present_flag)
-		v4l2r_bits_bit(&b);
+		if (pic->pic_fields.bits.separate_colour_plane_flag)
+			v4l2r_bits_read(&b, 2);
 
-	if (pic->pic_fields.bits.separate_colour_plane_flag)
-		v4l2r_bits_read(&b, 2);
+		if (!idr) {
 
-	if (idr) {
-		info->valid = !b.error;
-		return;
-	}
+			v4l2r_bits_read(&b, pic->log2_max_pic_order_cnt_lsb_minus4 + 4);
 
-	v4l2r_bits_read(&b, pic->log2_max_pic_order_cnt_lsb_minus4 + 4);
+			/*
+			 * short_term_ref_pic_set_sps_flag is NOT part of the st_ref_pic_set()
+			 * section, so measure after it: the hardware skips over the RPS using
+			 * short_term_ref_pic_set_size and accounts for this flag bit
+			 * separately. Including it made the value one bit too large and the
+			 * hardware started entropy decoding one bit early on every inter frame.
+			 */
+			if (!v4l2r_bits_bit(&b)) {	/* short_term_ref_pic_set_sps_flag */
+				/*
+				 * Inline st_ref_pic_set(): VA-API reports its exact bit size in
+				 * st_rps_bits. Parse only to recover num_delta_pocs_of_ref_rps_idx
+				 * (which VA-API does not carry) in the inter-prediction case, then
+				 * resync to the known size so a heuristic mis-parse can never
+				 * shift the rest of the slice header.
+				 */
+				mark = b.pos;
 
-	/*
-	 * short_term_ref_pic_set_sps_flag is NOT part of the st_ref_pic_set()
-	 * section, so measure after it: the hardware skips over the RPS using
-	 * short_term_ref_pic_set_size and accounts for this flag bit
-	 * separately. Including it made the value one bit too large and the
-	 * hardware started entropy decoding one bit early on every inter frame.
-	 */
-	if (!v4l2r_bits_bit(&b)) {	/* short_term_ref_pic_set_sps_flag */
-		/*
-		 * Inline st_ref_pic_set(): VA-API reports its exact bit size in
-		 * st_rps_bits. Parse only to recover num_delta_pocs_of_ref_rps_idx
-		 * (which VA-API does not carry) in the inter-prediction case, then
-		 * resync to the known size so a heuristic mis-parse can never
-		 * shift the rest of the slice header.
-		 */
-		mark = b.pos;
+				if (pic->num_short_term_ref_pic_sets && v4l2r_bits_bit(&b)) {
+					/* inter_ref_pic_set_prediction_flag == 1 */
+					unsigned int count = 0;
 
-		if (pic->num_short_term_ref_pic_sets && v4l2r_bits_bit(&b)) {
-			/* inter_ref_pic_set_prediction_flag == 1 */
-			unsigned int count = 0;
+					v4l2r_bits_ue(&b);		/* delta_idx_minus1 */
+					v4l2r_bits_bit(&b);		/* delta_rps_sign */
+					v4l2r_bits_ue(&b);		/* abs_delta_rps_minus1 */
 
-			v4l2r_bits_ue(&b);		/* delta_idx_minus1 */
-			v4l2r_bits_bit(&b);		/* delta_rps_sign */
-			v4l2r_bits_ue(&b);		/* abs_delta_rps_minus1 */
+					while (!b.error && b.pos - mark < pic->st_rps_bits) {
+						if (!v4l2r_bits_bit(&b) &&
+								b.pos - mark < pic->st_rps_bits)
+							v4l2r_bits_bit(&b);
+						count++;
+					}
 
-			while (!b.error && b.pos - mark < pic->st_rps_bits) {
-				if (!v4l2r_bits_bit(&b) &&
-				    b.pos - mark < pic->st_rps_bits)
-					v4l2r_bits_bit(&b);
-				count++;
-			}
+					if (count)
+						info->num_delta_pocs_of_ref_rps_idx = count - 1;
+				}
 
-			if (count)
-				info->num_delta_pocs_of_ref_rps_idx = count - 1;
-		}
+				if (b.pos - mark < pic->st_rps_bits) {
+					/* st_rps_bits is client-supplied; never skip past the end
+					 * of the slice data (a bogus value would otherwise spin
+					 * the bit reader for billions of no-op iterations). */
+					size_t skip = pic->st_rps_bits - (b.pos - mark);
+					size_t avail = size * 8;
 
-		if (b.pos - mark < pic->st_rps_bits) {
-			/* st_rps_bits is client-supplied; never skip past the end
-			 * of the slice data (a bogus value would otherwise spin
-			 * the bit reader for billions of no-op iterations). */
-			size_t skip = pic->st_rps_bits - (b.pos - mark);
-			size_t avail = size * 8;
+					v4l2r_bits_skip(&b, skip < avail ? skip : avail);
+				}
 
-			v4l2r_bits_skip(&b, skip < avail ? skip : avail);
-		}
-
-		info->short_term_ref_pic_set_size = pic->st_rps_bits;
-	} else {
-		mark = b.pos;
-		if (pic->num_short_term_ref_pic_sets > 1)
-			v4l2r_bits_read(&b,
-					ceil_log2(pic->num_short_term_ref_pic_sets));
-		info->short_term_ref_pic_set_size = b.pos - mark;
-	}
-
-	mark = b.pos;
-	if (pic->slice_parsing_fields.bits.long_term_ref_pics_present_flag) {
-		uint32_t num_lt_sps = 0, num_lt_pics;
-
-		if (pic->num_long_term_ref_pic_sps > 0)
-			num_lt_sps = v4l2r_bits_ue(&b);
-		num_lt_pics = v4l2r_bits_ue(&b);
-
-		for (uint32_t i = 0; i < num_lt_sps + num_lt_pics && !b.error; i++) {
-			if (i < num_lt_sps) {
-				if (pic->num_long_term_ref_pic_sps > 1)
-					v4l2r_bits_read(&b,
-						ceil_log2(pic->num_long_term_ref_pic_sps));
+				info->short_term_ref_pic_set_size = pic->st_rps_bits;
 			} else {
-				v4l2r_bits_read(&b,
-					pic->log2_max_pic_order_cnt_lsb_minus4 + 4);
-				v4l2r_bits_bit(&b);	/* used_by_curr_pic_lt */
+				mark = b.pos;
+				if (pic->num_short_term_ref_pic_sets > 1)
+					v4l2r_bits_read(&b,
+							ceil_log2(pic->num_short_term_ref_pic_sets));
+				info->short_term_ref_pic_set_size = b.pos - mark;
 			}
 
-			if (v4l2r_bits_bit(&b))		/* delta_poc_msb_present */
-				v4l2r_bits_ue(&b);
+			mark = b.pos;
+			if (pic->slice_parsing_fields.bits.long_term_ref_pics_present_flag) {
+				uint32_t num_lt_sps = 0, num_lt_pics;
+
+				if (pic->num_long_term_ref_pic_sps > 0)
+					num_lt_sps = v4l2r_bits_ue(&b);
+				num_lt_pics = v4l2r_bits_ue(&b);
+
+				for (uint32_t i = 0; i < num_lt_sps + num_lt_pics && !b.error; i++) {
+					if (i < num_lt_sps) {
+						if (pic->num_long_term_ref_pic_sps > 1)
+							v4l2r_bits_read(&b,
+									ceil_log2(pic->num_long_term_ref_pic_sps));
+					} else {
+						v4l2r_bits_read(&b,
+								pic->log2_max_pic_order_cnt_lsb_minus4 + 4);
+						v4l2r_bits_bit(&b);	/* used_by_curr_pic_lt */
+					}
+					if (v4l2r_bits_bit(&b))		/* delta_poc_msb_present */
+						v4l2r_bits_ue(&b);
+				}
+			}
+			info->long_term_ref_pic_set_size = b.pos - mark;
+
+			if (pic->slice_parsing_fields.bits.sps_temporal_mvp_enabled_flag)
+				slice_temporal_mvp_enabled_flag = v4l2r_bits_bit(&b);
+		}
+
+		if (pic->slice_parsing_fields.bits.sample_adaptive_offset_enabled_flag) {
+			slice_sao_luma_flag = v4l2r_bits_bit(&b);
+			if (chroma_array_type != 0)
+				slice_sao_chroma_flag = v4l2r_bits_bit(&b);
+		}
+		if (slice_type == V4L2_HEVC_SLICE_TYPE_P
+				|| slice_type == V4L2_HEVC_SLICE_TYPE_B) {
+			if(v4l2r_bits_bit(&b)) {	/* num_ref_idx_active_override_flag */
+				num_ref_idx_l0_active_minus1 = v4l2r_bits_ue(&b);
+				if (slice_type == V4L2_HEVC_SLICE_TYPE_B)
+					num_ref_idx_l1_active_minus1 = v4l2r_bits_ue(&b);
+			}
+			if (pic->slice_parsing_fields.bits.lists_modification_present_flag &&
+					codec->num_pic_total_curr > 1) {
+				ref_pic_lists_modification(codec, &b,
+						num_ref_idx_l0_active_minus1,
+						num_ref_idx_l1_active_minus1,
+						slice_type == V4L2_HEVC_SLICE_TYPE_B);
+			}
+			if (slice_type == V4L2_HEVC_SLICE_TYPE_B)
+				v4l2r_bits_bit(&b);		/* mvd_l1_zero_flag */
+			if (pic->slice_parsing_fields.bits.cabac_init_present_flag)
+				v4l2r_bits_bit(&b);		/* cabac_init_flag */
+			if (slice_temporal_mvp_enabled_flag) {
+				if (slice_type == V4L2_HEVC_SLICE_TYPE_B)
+					collocated_from_l0_flag = v4l2r_bits_bit(&b);
+				if ((collocated_from_l0_flag &&
+						pic->num_ref_idx_l0_default_active_minus1 > 0)
+						|| (!collocated_from_l0_flag &&
+						pic->num_ref_idx_l1_default_active_minus1 > 0))
+					v4l2r_bits_ue(&b);	/* collocated_ref_idx */
+			}
+			if ((pic->pic_fields.bits.weighted_pred_flag &&
+					slice_type == V4L2_HEVC_SLICE_TYPE_P) ||
+					(pic->pic_fields.bits.weighted_bipred_flag &&
+					 slice_type == V4L2_HEVC_SLICE_TYPE_B)) {
+
+				v4l2r_bits_ue(&b);	/* luma_log2_weight_denom */
+				if(chroma_array_type != 0)
+					v4l2r_bits_ue(&b);	/* delta_chroma_log2_weight_denom */
+
+				pred_weight_table(&b, num_ref_idx_l0_active_minus1,
+						chroma_array_type);
+				if (slice_type == V4L2_HEVC_SLICE_TYPE_B)
+					pred_weight_table(&b, num_ref_idx_l1_active_minus1,
+							chroma_array_type);
+			}
+			v4l2r_bits_ue(&b);	/* five_minus_max_num_merge_cand */
+		}
+		v4l2r_bits_se(&b);	/* slice_qp_delta */
+		if (pic->slice_parsing_fields.bits.
+				pps_slice_chroma_qp_offsets_present_flag) {
+			v4l2r_bits_se(&b);	/* slice_cb_qp_offset */
+			v4l2r_bits_se(&b);	/* slice_cr_qp_offset */
+		}
+
+		if (pic->slice_parsing_fields.bits.
+				deblocking_filter_override_enabled_flag) {
+			if (v4l2r_bits_bit(&b)) {	/* deblocking_filter_override_flag */
+				slice_deblocking_filter_disabled_flag = v4l2r_bits_bit(&b);
+				if (!slice_deblocking_filter_disabled_flag) {
+					v4l2r_bits_se(&b);	/* slice_beta_offset_div2 */
+					v4l2r_bits_se(&b);	/* slice_tc_offset_div2 */
+				}
+			}
+		}
+		if (pic->pic_fields.bits.pps_loop_filter_across_slices_enabled_flag &&
+				(slice_sao_luma_flag || slice_sao_chroma_flag ||
+				 !slice_deblocking_filter_disabled_flag))
+			v4l2r_bits_bit(&b);	/* slice_loop_filter_across_slices_enabled_flag */
+	}
+
+	if (!codec->max_entry_point_offsets)
+		goto done;
+
+	if (pic->pic_fields.bits.tiles_enabled_flag ||
+			pic->pic_fields.bits.entropy_coding_sync_enabled_flag) {
+		info->num_entry_point_offsets = v4l2r_bits_ue(&b);
+
+		if (info->num_entry_point_offsets > 0 &&
+				info->num_entry_point_offsets < codec->max_entry_point_offsets
+				&& codec->num_entry_point_offsets +
+				info->num_entry_point_offsets < codec->max_entry_point_offsets) {
+			offset_len_minus1 = v4l2r_bits_ue(&b);
+			offset_len_minus1 = offset_len_minus1 > 31 ? 31 : offset_len_minus1;
+			for (uint32_t i = 0; i < info->num_entry_point_offsets; i++) {
+				codec->entry_point_offsets[codec->num_entry_point_offsets++]
+					= v4l2r_bits_read(&b, offset_len_minus1 + 1) + 1;
+			}
+		} else {
+			info->num_entry_point_offsets = 0;
 		}
 	}
-	info->long_term_ref_pic_set_size = b.pos - mark;
 
+
+done:
 	info->valid = !b.error;
 }
 
@@ -429,7 +583,10 @@ static void hevc_fill_decode_params(struct v4l2r_context *ctx,
 	 * Rebuild the RPS current lists from the VA reference flags:
 	 * before-list ordered by descending POC, after-list by ascending
 	 * POC, matching the specification derivation.
+	 *
+	 * Also derive the syntax element NumPicTotalCurr
 	 */
+	codec->num_pic_total_curr = 0;
 	for (int pass = 0; pass < 3; pass++) {
 		static const uint32_t flags[3] = {
 			VA_PICTURE_HEVC_RPS_ST_CURR_BEFORE,
@@ -446,6 +603,8 @@ static void hevc_fill_decode_params(struct v4l2r_context *ctx,
 				continue;
 			if (!(ref->flags & flags[pass]))
 				continue;
+
+			codec->num_pic_total_curr++;
 
 			list[count++] = codec->dpb_index_of_va[i];
 		}
@@ -540,8 +699,7 @@ static void hevc_fill_slice_params(struct v4l2r_context *ctx,
 	*params = (struct v4l2_ctrl_hevc_slice_params) {
 		.bit_size = (slice->slice_data_size + start_code_offset) * 8,
 		.data_byte_offset = slice->slice_data_byte_offset,
-
-		.num_entry_point_offsets = 0,
+		.num_entry_point_offsets = info->num_entry_point_offsets,
 
 		.nal_unit_type = info->nal_unit_type,
 		.nuh_temporal_id_plus1 = info->temporal_id_plus1,
@@ -610,7 +768,7 @@ static void hevc_fill_slice_params(struct v4l2r_context *ctx,
 static VAStatus hevc_submit(struct v4l2r_context *ctx, bool last_slice)
 {
 	struct hevc_context *codec = ctx->codec_priv;
-	struct v4l2_ext_control controls[5];
+	struct v4l2_ext_control controls[6];
 	unsigned int count = 0;
 
 	controls[count++] = (struct v4l2_ext_control) {
@@ -647,6 +805,18 @@ static VAStatus hevc_submit(struct v4l2r_context *ctx, bool last_slice)
 			.id = V4L2_CID_STATELESS_HEVC_SLICE_PARAMS,
 			.ptr = codec->slice_params,
 			.size = sizeof(*codec->slice_params) * nb,
+		};
+	}
+	if (codec->max_entry_point_offsets && codec->num_entry_point_offsets) {
+		unsigned int nb = codec->num_entry_point_offsets;
+
+		if (nb > codec->max_entry_point_offsets)
+			nb = codec->max_entry_point_offsets;
+
+		controls[count++] = (struct v4l2_ext_control) {
+			.id = V4L2_CID_STATELESS_HEVC_ENTRY_POINT_OFFSETS,
+			.ptr = codec->entry_point_offsets,
+			.size = sizeof(*codec->entry_point_offsets) * nb,
 		};
 	}
 
@@ -749,6 +919,9 @@ static VAStatus hevc_init(struct v4l2r_context *ctx)
 	struct v4l2_query_ext_ctrl ext_sps_st_rps = {
 		.id = V4L2_CID_STATELESS_HEVC_EXT_SPS_ST_RPS,
 	};
+	struct v4l2_query_ext_ctrl entry_point_offsets = {
+		.id = V4L2_CID_STATELESS_HEVC_ENTRY_POINT_OFFSETS,
+	};
 	struct v4l2_ext_control controls[2];
 	int ret;
 
@@ -792,6 +965,21 @@ static VAStatus hevc_init(struct v4l2r_context *ctx)
 	else
 		codec->max_slice_params = 0;
 
+	if (!v4l2r_query_control(ctx, &entry_point_offsets))
+		codec->max_entry_point_offsets = entry_point_offsets.dims[0] ?
+			entry_point_offsets.dims[0] : 255; /* max if unspecified */
+	else
+		codec->max_entry_point_offsets = 0;
+
+	if (codec->max_entry_point_offsets) {
+		if (v4l2r_array_reserve((void **)&codec->entry_point_offsets,
+					&codec->alloc_entry_point_offsets,
+					codec->max_entry_point_offsets + 1,
+					sizeof(*codec->entry_point_offsets)) < 0)
+			return VA_STATUS_ERROR_ALLOCATION_FAILED;
+	}
+
+
 	controls[0] = (struct v4l2_ext_control) {
 		.id = V4L2_CID_STATELESS_HEVC_DECODE_MODE,
 		.value = codec->decode_mode,
@@ -813,10 +1001,13 @@ static void hevc_uninit(struct v4l2r_context *ctx)
 
 	free(codec->slice_params);
 	free(codec->va_slices);
+	free(codec->entry_point_offsets);
 	codec->slice_params = NULL;
 	codec->va_slices = NULL;
+	codec->entry_point_offsets = NULL;
 	codec->alloc_slice_params = 0;
 	codec->alloc_va_slices = 0;
+	codec->alloc_entry_point_offsets = 0;
 }
 
 static VAStatus hevc_begin_picture(struct v4l2r_context *ctx)
@@ -829,6 +1020,8 @@ static VAStatus hevc_begin_picture(struct v4l2r_context *ctx)
 	codec->num_slice_params = 0;
 	codec->num_slices = 0;
 	codec->first_slice = true;
+	codec->num_entry_point_offsets = 0;
+	codec->num_pic_total_curr = 0;
 	memset(&codec->decode_params, 0, sizeof(codec->decode_params));
 
 	return VA_STATUS_SUCCESS;
