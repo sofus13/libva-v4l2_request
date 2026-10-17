@@ -24,6 +24,7 @@
 #include <drm_fourcc.h>
 
 #include "v4l2_request.h"
+#include "codec/codec.h"
 
 /* Needs the va.h types pulled in by v4l2_request.h. */
 #include <va/va_backend_vpp.h>

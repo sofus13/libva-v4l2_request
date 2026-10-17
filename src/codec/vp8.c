@@ -16,7 +16,7 @@
 #include <linux/videodev2.h>
 #include <linux/v4l2-controls.h>
 
-#include "v4l2_request.h"
+#include "codec.h"
 
 #include <va/va_dec_vp8.h>
 

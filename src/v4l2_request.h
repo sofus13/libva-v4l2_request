@@ -337,35 +337,6 @@ struct v4l2r_convert {
 	bool failed;			/* chain broke (layout/queue error), disabled */
 };
 
-/*
- * Codec backend: translates VA parameter buffers into V4L2 stateless
- * controls and drives the request submission through the decode engine.
- */
-struct v4l2r_codec {
-	const char *name;
-	uint32_t pixelformat;
-	const VAProfile *profiles;
-	unsigned int nb_profiles;
-	size_t priv_size;
-
-	/* Called once after the OUTPUT format is set (device is chosen but
-	 * not yet streaming); query decode mode and friends here. */
-	VAStatus (*init)(struct v4l2r_context *ctx);
-	void (*uninit)(struct v4l2r_context *ctx);
-	VAStatus (*begin_picture)(struct v4l2r_context *ctx);
-	VAStatus (*render_buffer)(struct v4l2r_context *ctx,
-				  struct v4l2r_buffer *buf);
-	VAStatus (*end_picture)(struct v4l2r_context *ctx);
-
-	/* Optional: some codecs (AV1) hold the most recent frame back by one
-	 * to reconstruct state that is only known once the next frame arrives.
-	 * Called before a surface is read or synced so any decode still held
-	 * for that surface is submitted first. A NULL target matches any held
-	 * frame, flushing it unconditionally. */
-	VAStatus (*flush)(struct v4l2r_context *ctx,
-			  struct v4l2r_surface *target);
-};
-
 /* Submit any decode a codec is holding back for this surface (no-op unless
  * the surface belongs to a context whose codec defers submission). */
 void v4l2r_flush_surface(struct v4l2r_surface *surface);
@@ -649,15 +620,6 @@ int v4l2r_export_capture_dmabufs(struct v4l2r_context *ctx,
  * destination format (NV12 at the converter CAPTURE layout). */
 VAStatus v4l2r_surface_convert_backing(struct v4l2r_driver *drv,
 				       struct v4l2r_surface *surface);
-
-/* --- codec table --- */
-
-extern const struct v4l2r_codec v4l2r_codec_mpeg2;
-extern const struct v4l2r_codec v4l2r_codec_h264;
-extern const struct v4l2r_codec v4l2r_codec_hevc;
-extern const struct v4l2r_codec v4l2r_codec_vp8;
-extern const struct v4l2r_codec v4l2r_codec_vp9;
-extern const struct v4l2r_codec v4l2r_codec_av1;
 
 const struct v4l2r_codec *v4l2r_codec_for_profile(VAProfile profile);
 const struct v4l2r_codec **v4l2r_codec_list(unsigned int *count);

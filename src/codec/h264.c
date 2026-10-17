@@ -17,7 +17,7 @@
 #include <linux/videodev2.h>
 #include <linux/v4l2-controls.h>
 
-#include "v4l2_request.h"
+#include "codec.h"
 #include "bits.h"
 
 #if HAVE_V4L2_CTRL_H264

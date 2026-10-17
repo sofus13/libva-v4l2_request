@@ -24,6 +24,7 @@
 #include <linux/videodev2.h>
 
 #include "v4l2_request.h"
+#include "codec/codec.h"
 
 static int set_format(struct v4l2r_context *ctx, enum v4l2_buf_type type,
 		      uint32_t pixelformat, uint32_t buffersize)

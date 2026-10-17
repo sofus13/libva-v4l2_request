@@ -24,6 +24,7 @@
 #include <va/va_drmcommon.h>
 
 #include "v4l2_request.h"
+#include "codec/codec.h"
 
 VAStatus v4l2r_CreateSurfaces2(VADriverContextP va_ctx, unsigned int format,
 			       unsigned int width, unsigned int height,

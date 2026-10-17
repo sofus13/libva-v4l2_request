@@ -7,12 +7,12 @@ sources = [
   'surface.c',
   'buffer.c',
   'image.c',
-  'codec_mpeg2.c',
-  'codec_h264.c',
-  'codec_hevc.c',
-  'codec_vp8.c',
-  'codec_vp9.c',
-  'codec_av1.c',
+  'codec/mpeg2.c',
+  'codec/h264.c',
+  'codec/hevc.c',
+  'codec/vp8.c',
+  'codec/vp9.c',
+  'codec/av1.c',
 ]
 
 shared_module('v4l2_request_drv_video',
