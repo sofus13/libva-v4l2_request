@@ -320,6 +320,9 @@ static VAStatus backing_alloc(struct v4l2r_driver *drv,
 			       capability.device_caps : capability.capabilities;
 		mplane = capabilities & V4L2_CAP_VIDEO_M2M_MPLANE;
 
+		if (!mplane)
+			goto next;
+
 		/*
 		 * Stateless decoders derive the CAPTURE geometry from the
 		 * coded OUTPUT format and ignore the dimensions passed to
@@ -329,63 +332,37 @@ static VAStatus backing_alloc(struct v4l2r_driver *drv,
 		 * the resolution we actually asked for.
 		 */
 		struct v4l2_format out = {
-			.type = mplane ?
-				V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE :
-				V4L2_BUF_TYPE_VIDEO_OUTPUT,
+			.type = V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE,
 		};
 		uint32_t coded = drv->decoders[n].nb_pixelformats ?
 				 drv->decoders[n].pixelformats[0] : 0;
 
-		if (mplane) {
-			out.fmt.pix_mp.width = width;
-			out.fmt.pix_mp.height = height;
-			out.fmt.pix_mp.pixelformat = coded;
-			out.fmt.pix_mp.num_planes = 1;
-		} else {
-			out.fmt.pix.width = width;
-			out.fmt.pix.height = height;
-			out.fmt.pix.pixelformat = coded;
-		}
+		out.fmt.pix_mp.width = width;
+		out.fmt.pix_mp.height = height;
+		out.fmt.pix_mp.pixelformat = coded;
+		out.fmt.pix_mp.num_planes = 1;
 
 		if (coded && ioctl(fd, VIDIOC_S_FMT, &out) < 0)
 			goto next;
 
-		format.type = mplane ? V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE :
-				       V4L2_BUF_TYPE_VIDEO_CAPTURE;
-		if (mplane) {
-			format.fmt.pix_mp.width = width;
-			format.fmt.pix_mp.height = height;
-			format.fmt.pix_mp.pixelformat = pixelformat;
-			format.fmt.pix_mp.num_planes = 1;
-		} else {
-			format.fmt.pix.width = width;
-			format.fmt.pix.height = height;
-			format.fmt.pix.pixelformat = pixelformat;
-		}
+		format.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
+		format.fmt.pix_mp.width = width;
+		format.fmt.pix_mp.height = height;
+		format.fmt.pix_mp.pixelformat = pixelformat;
+		format.fmt.pix_mp.num_planes = 1;
 
 		if (ioctl(fd, VIDIOC_S_FMT, &format) < 0)
 			goto next;
 
 		/* The device must produce exactly the requested layout. */
-		if (mplane) {
-			if (format.fmt.pix_mp.pixelformat != pixelformat ||
-			    format.fmt.pix_mp.width < width ||
-			    format.fmt.pix_mp.height < height)
-				goto next;
-			backing->width = format.fmt.pix_mp.width;
-			backing->height = format.fmt.pix_mp.height;
-			backing->pitch = format.fmt.pix_mp.plane_fmt[0].bytesperline;
-			backing->nb_planes = format.fmt.pix_mp.num_planes;
-		} else {
-			if (format.fmt.pix.pixelformat != pixelformat ||
-			    format.fmt.pix.width < width ||
-			    format.fmt.pix.height < height)
-				goto next;
-			backing->width = format.fmt.pix.width;
-			backing->height = format.fmt.pix.height;
-			backing->pitch = format.fmt.pix.bytesperline;
-			backing->nb_planes = 1;
-		}
+		if (format.fmt.pix_mp.pixelformat != pixelformat ||
+		    format.fmt.pix_mp.width < width ||
+		    format.fmt.pix_mp.height < height)
+			goto next;
+		backing->width = format.fmt.pix_mp.width;
+		backing->height = format.fmt.pix_mp.height;
+		backing->pitch = format.fmt.pix_mp.plane_fmt[0].bytesperline;
+		backing->nb_planes = format.fmt.pix_mp.num_planes;
 
 		buffers = (struct v4l2_create_buffers) {
 			.count = 1,
@@ -397,21 +374,15 @@ static VAStatus backing_alloc(struct v4l2r_driver *drv,
 
 		buffer.type = format.type;
 		buffer.index = buffers.index;
-		if (mplane) {
-			buffer.length = VIDEO_MAX_PLANES;
-			buffer.m.planes = planes;
-		}
+		buffer.length = VIDEO_MAX_PLANES;
+		buffer.m.planes = planes;
+
 		if (ioctl(fd, VIDIOC_QUERYBUF, &buffer) < 0)
 			goto next;
 
-		if (mplane) {
-			backing->nb_planes = buffer.length;
-			for (unsigned int i = 0; i < buffer.length; i++)
-				backing->plane_size[i] = buffer.m.planes[i].length;
-		} else {
-			backing->nb_planes = 1;
-			backing->plane_size[0] = buffer.length;
-		}
+		backing->nb_planes = buffer.length;
+		for (unsigned int i = 0; i < buffer.length; i++)
+			backing->plane_size[i] = buffer.m.planes[i].length;
 
 		for (unsigned int i = 0; i < backing->nb_planes; i++) {
 			struct v4l2_exportbuffer exportbuffer = {
@@ -561,9 +532,9 @@ VAStatus v4l2r_surface_capture_view(struct v4l2r_surface *surface,
 		return VA_STATUS_ERROR_OPERATION_FAILED;
 
 	view->pixelformat = view->info->pixelformat;
-	view->width = v4l2r_format_width(format);
-	view->height = v4l2r_format_height(format);
-	view->pitch = v4l2r_format_bytesperline(format);
+	view->width = format->fmt.pix_mp.width;
+	view->height = format->fmt.pix_mp.height;
+	view->pitch = format->fmt.pix_mp.plane_fmt[0].bytesperline;
 	view->nb_planes = capture->nb_planes;
 
 	if (v4l2r_export_capture_dmabufs(ctx, capture,

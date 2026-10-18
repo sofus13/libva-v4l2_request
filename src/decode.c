@@ -102,12 +102,10 @@ static int queue_buffer(struct v4l2r_context *ctx, struct v4l2_buffer *buffer)
 {
 	struct v4l2_plane planes[VIDEO_MAX_PLANES] = {0};
 
-	if (V4L2_TYPE_IS_MULTIPLANAR(buffer->type)) {
-		planes[0].bytesused = buffer->bytesused;
-		buffer->bytesused = 0;
-		buffer->length = 1;
-		buffer->m.planes = planes;
-	}
+	planes[0].bytesused = buffer->bytesused;
+	buffer->bytesused = 0;
+	buffer->length = 1;
+	buffer->m.planes = planes;
 
 	if (ioctl(ctx->video_fd, VIDIOC_QBUF, buffer) < 0)
 		return -errno;
@@ -168,12 +166,9 @@ static int dequeue_buffer(struct v4l2r_context *ctx, enum v4l2_buf_type type)
 	struct v4l2_buffer buffer = {
 		.type = type,
 		.memory = V4L2_MEMORY_MMAP,
+		.length = 1,
+		.m.planes = planes
 	};
-
-	if (V4L2_TYPE_IS_MULTIPLANAR(type)) {
-		buffer.length = 1;
-		buffer.m.planes = planes;
-	}
 
 	if (ioctl(ctx->video_fd, VIDIOC_DQBUF, &buffer) < 0)
 		return -errno;

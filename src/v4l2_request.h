@@ -400,38 +400,6 @@ static inline void *v4l2r_handles_get(struct v4l2r_driver *drv,
 #define V4L2R_IMAGE_GET(drv, id) \
 	((struct v4l2r_image *)v4l2r_handles_get(drv, &(drv)->images, id))
 
-/* Accessors hiding the single/multi-planar v4l2_format split. */
-static inline uint32_t v4l2r_format_pixelformat(const struct v4l2_format *format)
-{
-	return V4L2_TYPE_IS_MULTIPLANAR(format->type) ?
-	       format->fmt.pix_mp.pixelformat : format->fmt.pix.pixelformat;
-}
-
-static inline uint32_t v4l2r_format_width(const struct v4l2_format *format)
-{
-	return V4L2_TYPE_IS_MULTIPLANAR(format->type) ?
-	       format->fmt.pix_mp.width : format->fmt.pix.width;
-}
-
-static inline uint32_t v4l2r_format_height(const struct v4l2_format *format)
-{
-	return V4L2_TYPE_IS_MULTIPLANAR(format->type) ?
-	       format->fmt.pix_mp.height : format->fmt.pix.height;
-}
-
-static inline uint32_t v4l2r_format_bytesperline(const struct v4l2_format *format)
-{
-	return V4L2_TYPE_IS_MULTIPLANAR(format->type) ?
-	       format->fmt.pix_mp.plane_fmt[0].bytesperline :
-	       format->fmt.pix.bytesperline;
-}
-
-static inline uint32_t v4l2r_format_num_planes(const struct v4l2_format *format)
-{
-	return V4L2_TYPE_IS_MULTIPLANAR(format->type) ?
-	       format->fmt.pix_mp.num_planes : 1;
-}
-
 /*
  * CAPTURE pixelformats the driver knows how to hand out, together with the
  * DRM description used for dma-buf export. Mirrors the FFmpeg hwcontext

@@ -203,7 +203,7 @@ const struct v4l2r_format_info *v4l2r_capture_format_info(struct v4l2r_context *
 		return NULL;
 
 	return v4l2r_format_by_pixelformat(
-		v4l2r_format_pixelformat(&ctx->capture_format));
+		ctx->capture_format.fmt.pix_mp.pixelformat);
 }
 
 /* --- device enumeration --- */
@@ -255,7 +255,6 @@ static int devnode_from_devnum(uint32_t major, uint32_t minor, char *path,
 static bool video_device_probe_hevc_10bit(int fd, uint32_t output_type)
 {
 #if HAVE_V4L2_CTRL_HEVC
-	bool mplane = V4L2_TYPE_IS_MULTIPLANAR(output_type);
 	struct v4l2_format format = { .type = output_type };
 	struct v4l2_ctrl_hevc_sps sps = {
 		.chroma_format_idc = 1,
@@ -276,29 +275,18 @@ static bool video_device_probe_hevc_10bit(int fd, uint32_t output_type)
 		.controls = &control,
 	};
 
-	if (mplane) {
-		format.fmt.pix_mp.width = 1920;
-		format.fmt.pix_mp.height = 1088;
-		format.fmt.pix_mp.pixelformat = V4L2_PIX_FMT_HEVC_SLICE;
-		format.fmt.pix_mp.num_planes = 1;
-	} else {
-		format.fmt.pix.width = 1920;
-		format.fmt.pix.height = 1088;
-		format.fmt.pix.pixelformat = V4L2_PIX_FMT_HEVC_SLICE;
-	}
+	format.fmt.pix_mp.width = 1920;
+	format.fmt.pix_mp.height = 1088;
+	format.fmt.pix_mp.pixelformat = V4L2_PIX_FMT_HEVC_SLICE;
+	format.fmt.pix_mp.num_planes = 1;
 
 	if (ioctl(fd, VIDIOC_S_FMT, &format) < 0)
 		return false;
 
 	/* Size the SPS to what the device accepted; some drivers reject an SPS
 	 * larger than the current OUTPUT format. */
-	if (mplane) {
-		sps.pic_width_in_luma_samples = format.fmt.pix_mp.width;
-		sps.pic_height_in_luma_samples = format.fmt.pix_mp.height;
-	} else {
-		sps.pic_width_in_luma_samples = format.fmt.pix.width;
-		sps.pic_height_in_luma_samples = format.fmt.pix.height;
-	}
+	sps.pic_width_in_luma_samples = format.fmt.pix_mp.width;
+	sps.pic_height_in_luma_samples = format.fmt.pix_mp.height;
 
 	return ioctl(fd, VIDIOC_S_EXT_CTRLS, &controls) == 0;
 #else
@@ -335,8 +323,6 @@ static bool video_device_is_request_decoder(const char *path,
 
 	if (capabilities & V4L2_CAP_VIDEO_M2M_MPLANE)
 		output_type = V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE;
-	else if (capabilities & V4L2_CAP_VIDEO_M2M)
-		output_type = V4L2_BUF_TYPE_VIDEO_OUTPUT;
 	else
 		goto fail;
 

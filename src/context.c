@@ -33,18 +33,11 @@ static int set_format(struct v4l2r_context *ctx, enum v4l2_buf_type type,
 		.type = type,
 	};
 
-	if (V4L2_TYPE_IS_MULTIPLANAR(type)) {
-		format.fmt.pix_mp.width = ctx->picture_width;
-		format.fmt.pix_mp.height = ctx->picture_height;
-		format.fmt.pix_mp.pixelformat = pixelformat;
-		format.fmt.pix_mp.plane_fmt[0].sizeimage = buffersize;
-		format.fmt.pix_mp.num_planes = 1;
-	} else {
-		format.fmt.pix.width = ctx->picture_width;
-		format.fmt.pix.height = ctx->picture_height;
-		format.fmt.pix.pixelformat = pixelformat;
-		format.fmt.pix.sizeimage = buffersize;
-	}
+	format.fmt.pix_mp.width = ctx->picture_width;
+	format.fmt.pix_mp.height = ctx->picture_height;
+	format.fmt.pix_mp.pixelformat = pixelformat;
+	format.fmt.pix_mp.plane_fmt[0].sizeimage = buffersize;
+	format.fmt.pix_mp.num_planes = 1;
 
 	if (ioctl(ctx->video_fd, VIDIOC_S_FMT, &format) < 0)
 		return -errno;
@@ -159,7 +152,7 @@ static int select_capture_format(struct v4l2r_context *ctx)
 	/* Prefer the driver default over other non-linear candidates. */
 	if (best_score < 6 &&
 	    ioctl(ctx->video_fd, VIDIOC_G_FMT, &format) >= 0) {
-		info = v4l2r_format_by_pixelformat(v4l2r_format_pixelformat(&format));
+		info = v4l2r_format_by_pixelformat(format.fmt.pix_mp.pixelformat);
 		if (info && (!ctx->bit_depth || info->bit_depth == ctx->bit_depth))
 			best = info->pixelformat;
 	}
@@ -204,13 +197,8 @@ static int output_buffer_setup(struct v4l2r_context *ctx,
 	off_t offset;
 	void *addr;
 
-	if (sizeimage) {
-		if (V4L2_TYPE_IS_MULTIPLANAR(buffers.format.type))
-			buffers.format.fmt.pix_mp.plane_fmt[0].sizeimage =
-				sizeimage;
-		else
-			buffers.format.fmt.pix.sizeimage = sizeimage;
-	}
+	if (sizeimage)
+		buffers.format.fmt.pix_mp.plane_fmt[0].sizeimage = sizeimage;
 
 	if (ioctl(ctx->video_fd, VIDIOC_CREATE_BUFS, &buffers) < 0) {
 		v4l2r_log("failed to create OUTPUT buffer: %s\n",
@@ -224,10 +212,8 @@ static int output_buffer_setup(struct v4l2r_context *ctx,
 
 	buffer.type = ctx->output_format.type;
 	buffer.index = buffers.index;
-	if (V4L2_TYPE_IS_MULTIPLANAR(buffer.type)) {
-		buffer.length = VIDEO_MAX_PLANES;
-		buffer.m.planes = planes;
-	}
+	buffer.length = VIDEO_MAX_PLANES;
+	buffer.m.planes = planes;
 
 	if (ioctl(ctx->video_fd, VIDIOC_QUERYBUF, &buffer) < 0) {
 		v4l2r_log("failed to query OUTPUT buffer %u: %s\n",
@@ -236,13 +222,8 @@ static int output_buffer_setup(struct v4l2r_context *ctx,
 	}
 
 	output->index = buffer.index;
-	if (V4L2_TYPE_IS_MULTIPLANAR(buffer.type)) {
-		output->size = buffer.m.planes[0].length;
-		offset = buffer.m.planes[0].m.mem_offset;
-	} else {
-		output->size = buffer.length;
-		offset = buffer.m.offset;
-	}
+	output->size = buffer.m.planes[0].length;
+	offset = buffer.m.planes[0].m.mem_offset;
 
 	addr = mmap(NULL, output->size, PROT_READ | PROT_WRITE, MAP_SHARED,
 		    ctx->video_fd, offset);
@@ -366,12 +347,8 @@ static size_t capture_format_bytes(const struct v4l2_format *fmt)
 {
 	size_t bytes = 0;
 
-	if (V4L2_TYPE_IS_MULTIPLANAR(fmt->type)) {
-		for (unsigned int i = 0; i < fmt->fmt.pix_mp.num_planes; i++)
-			bytes += fmt->fmt.pix_mp.plane_fmt[i].sizeimage;
-	} else {
-		bytes = fmt->fmt.pix.sizeimage;
-	}
+	for (unsigned int i = 0; i < fmt->fmt.pix_mp.num_planes; i++)
+		bytes += fmt->fmt.pix_mp.plane_fmt[i].sizeimage;
 
 	return bytes;
 }
@@ -412,10 +389,8 @@ static int capture_buffer_new(struct v4l2r_context *ctx)
 
 	buffer.type = ctx->capture_format.type;
 	buffer.index = buffers.index;
-	if (V4L2_TYPE_IS_MULTIPLANAR(buffer.type)) {
-		buffer.length = VIDEO_MAX_PLANES;
-		buffer.m.planes = planes;
-	}
+	buffer.length = VIDEO_MAX_PLANES;
+	buffer.m.planes = planes;
 
 	if (ioctl(ctx->video_fd, VIDIOC_QUERYBUF, &buffer) < 0) {
 		v4l2r_log("failed to query CAPTURE buffer %u: %s\n",
@@ -426,16 +401,10 @@ static int capture_buffer_new(struct v4l2r_context *ctx)
 	capture = &ctx->captures[buffer.index];
 	memset(capture, 0, sizeof(*capture));
 
-	if (V4L2_TYPE_IS_MULTIPLANAR(buffer.type)) {
-		capture->nb_planes = ctx->capture_format.fmt.pix_mp.num_planes;
-		for (unsigned int i = 0; i < capture->nb_planes; i++) {
-			capture->plane_mem_offset[i] = buffer.m.planes[i].m.mem_offset;
-			capture->plane_size[i] = buffer.m.planes[i].length;
-		}
-	} else {
-		capture->nb_planes = 1;
-		capture->plane_mem_offset[0] = buffer.m.offset;
-		capture->plane_size[0] = buffer.length;
+	capture->nb_planes = ctx->capture_format.fmt.pix_mp.num_planes;
+	for (unsigned int i = 0; i < capture->nb_planes; i++) {
+		capture->plane_mem_offset[i] = buffer.m.planes[i].m.mem_offset;
+		capture->plane_size[i] = buffer.m.planes[i].length;
 	}
 
 	for (unsigned int i = 0; i < VIDEO_MAX_PLANES; i++)
@@ -662,9 +631,9 @@ VAStatus v4l2r_context_bind_surface(struct v4l2r_context *ctx,
 		ctx->streaming = true;
 
 		v4l2r_log("using CAPTURE format %.4s (%ux%u)\n",
-			  (const char *)&(uint32_t){v4l2r_format_pixelformat(&ctx->capture_format)},
-			  v4l2r_format_width(&ctx->capture_format),
-			  v4l2r_format_height(&ctx->capture_format));
+			  (const char *)&(uint32_t){ctx->capture_format.fmt.pix_mp.pixelformat},
+			  ctx->capture_format.fmt.pix_mp.width,
+			  ctx->capture_format.fmt.pix_mp.height);
 	}
 
 	return VA_STATUS_SUCCESS;
@@ -752,9 +721,6 @@ VAStatus v4l2r_CreateContext(VADriverContextP va_ctx, VAConfigID config_id,
 		if (capabilities & V4L2_CAP_VIDEO_M2M_MPLANE) {
 			ctx->output_format.type = V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE;
 			ctx->capture_format.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
-		} else if (capabilities & V4L2_CAP_VIDEO_M2M) {
-			ctx->output_format.type = V4L2_BUF_TYPE_VIDEO_OUTPUT;
-			ctx->capture_format.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
 		} else {
 			goto next;
 		}

@@ -609,16 +609,16 @@ static int vpp_set_format(int fd, enum v4l2_buf_type type,
 		    format->fmt.pix_mp.num_planes != 1)
 			return -EINVAL;
 
-		if (v4l2r_format_bytesperline(format) == pitch)
+		if (format->fmt.pix_mp.plane_fmt[0].bytesperline == pitch)
 			return 0;
 
-		if (attempt || !v4l2r_format_bytesperline(format))
+		if (attempt || !format->fmt.pix_mp.plane_fmt[0].bytesperline)
 			break;
 
 		/* Stride scales linearly with the width for the packed
 		 * single-plane YUV formats used here. */
 		width = (uint32_t)((uint64_t)width * pitch /
-				   v4l2r_format_bytesperline(format));
+				   format->fmt.pix_mp.plane_fmt[0].bytesperline);
 	}
 
 	return -EINVAL;
