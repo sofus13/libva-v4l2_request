@@ -176,9 +176,6 @@ struct v4l2r_surface {
 	int capture_index;		/* CAPTURE buffer index, -1 if unbound */
 	VASurfaceStatus status;
 	struct v4l2r_surface_backing *backing;
-	/* A finished decode still needs (or is undergoing) format conversion
-	 * into the backing. Protected by ctx->mutex. */
-	bool convert_pending;
 	/* Codec scratch, e.g. the AV1 order hint of the decoded frame. */
 	uint32_t codec_tag;
 };
@@ -309,32 +306,9 @@ struct v4l2r_context {
 	struct v4l2r_picture pic;
 	bool in_picture;
 
-	/* Format conversion chain (NULL when the CAPTURE format is directly
-	 * consumable); see convert.c. */
-	struct v4l2r_convert *conv;
-
 	/* Video processing state for VAEntrypointVideoProc contexts; such
 	 * contexts have no codec, decoder device or queues. See convert.c. */
 	struct v4l2r_vpp *vpp;
-};
-
-/*
- * Per-context state of the format converter chain: decoded frames are run
- * through a mem2mem converter (decoder CAPTURE dma-buf in, surface backing
- * dma-buf out) as soon as their decode finishes. All fields are protected
- * by ctx->mutex.
- */
-struct v4l2r_convert {
-	int fd;
-	struct v4l2_format output_format;	/* source = decoder CAPTURE format */
-	struct v4l2_format capture_format;	/* destination, NV12 */
-	uint32_t busy;				/* bitmask of in-flight slots */
-	unsigned int next_slot;
-	struct {
-		int capture_index;		/* decoder CAPTURE buffer read */
-		struct v4l2r_surface *surface;	/* destination surface */
-	} jobs[V4L2R_CONVERT_SLOTS];
-	bool failed;			/* chain broke (layout/queue error), disabled */
 };
 
 /* Submit any decode a codec is holding back for this surface (no-op unless
@@ -499,23 +473,6 @@ bool v4l2r_converter_available(struct v4l2r_driver *drv);
 /* Whether the detected converter can read this pixelformat. */
 bool v4l2r_converter_supports(struct v4l2r_driver *drv, uint32_t pixelformat);
 
-/* Set up the conversion chain for the context's selected CAPTURE format.
- * Called once from the CAPTURE setup path; on failure the context decodes
- * without conversion (and 10-bit output stays NV15). */
-VAStatus v4l2r_convert_setup(struct v4l2r_context *ctx);
-void v4l2r_convert_destroy(struct v4l2r_context *ctx);
-
-/* Queue the conversion of a just-decoded CAPTURE buffer into its surface's
- * backing. Called with ctx->mutex held, right after the CAPTURE dequeue. */
-void v4l2r_convert_kick(struct v4l2r_context *ctx, int capture_index);
-
-/* Wait until no in-flight conversion reads this CAPTURE buffer anymore,
- * before the buffer is overwritten by a new decode. Takes ctx->mutex. */
-void v4l2r_convert_drain_index(struct v4l2r_context *ctx, int capture_index);
-
-/* Wait for the surface's pending conversion to finish. Takes ctx->mutex. */
-VAStatus v4l2r_convert_wait(struct v4l2r_surface *surface);
-
 /* --- video processing (convert.c) --- */
 
 /* Per-context state of a VAEntrypointVideoProc context: rotation, mirroring
@@ -583,11 +540,6 @@ VAStatus v4l2r_surface_capture_view(struct v4l2r_surface *surface,
 int v4l2r_export_capture_dmabufs(struct v4l2r_context *ctx,
 				 struct v4l2r_capture_buffer *capture,
 				 int capture_index);
-
-/* Ensure the surface has standalone backing matching the converter's
- * destination format (NV12 at the converter CAPTURE layout). */
-VAStatus v4l2r_surface_convert_backing(struct v4l2r_driver *drv,
-				       struct v4l2r_surface *surface);
 
 const struct v4l2r_codec *v4l2r_codec_for_profile(VAProfile profile);
 const struct v4l2r_codec **v4l2r_codec_list(unsigned int *count);

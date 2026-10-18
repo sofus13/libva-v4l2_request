@@ -500,7 +500,6 @@ static int capture_buffer_bind(struct v4l2r_context *ctx,
 	uint64_t t1 = v4l2r_now_ns();
 	v4l2r_wait_completed(ctx, ctx->captures[index].last_ref_seq);
 	uint64_t t2 = v4l2r_now_ns();
-	v4l2r_convert_drain_index(ctx, index);
 
 	/*
 	 * The decoder writes into this buffer and the kernel offers no implicit
@@ -575,30 +574,6 @@ VAStatus v4l2r_context_bind_surface(struct v4l2r_context *ctx,
 		if (ret < 0)
 			return VA_STATUS_ERROR_OPERATION_FAILED;
 
-		/*
-		 * When the decoder can only produce a format nothing can
-		 * consume directly (packed 10-bit NV15), chain the hardware
-		 * format converter behind it. Without a converter such a
-		 * stream cannot be presented at all: fail the decode so the
-		 * client falls back to software instead of getting frames
-		 * it cannot display.
-		 */
-		{
-			const struct v4l2r_format_info *info =
-				v4l2r_format_by_pixelformat(
-					v4l2r_format_pixelformat(&ctx->capture_format));
-
-			if (info && !info->va_fourcc) {
-				v4l2r_convert_setup(ctx);
-				if (!ctx->conv) {
-					v4l2r_log("no usable format converter for %.4s, "
-						  "refusing hardware decoding\n",
-						  (const char *)&info->pixelformat);
-					return VA_STATUS_ERROR_OPERATION_FAILED;
-				}
-			}
-		}
-
 		type = ctx->output_format.type;
 		if (ioctl(ctx->video_fd, VIDIOC_STREAMON, &type) < 0) {
 			v4l2r_log("failed to start OUTPUT streaming: %s\n",
@@ -617,8 +592,7 @@ VAStatus v4l2r_context_bind_surface(struct v4l2r_context *ctx,
 	 * standalone backing from pre-decode export probing. With a
 	 * conversion chain the backing IS the presented storage - keep it
 	 * (v4l2r_surface_convert_backing replaces a mismatched one). */
-	if (!ctx->conv)
-		v4l2r_surface_free_backing(surface);
+	v4l2r_surface_free_backing(surface);
 
 	if (starting) {
 		type = ctx->capture_format.type;
@@ -857,7 +831,6 @@ VAStatus v4l2r_DestroyContext(VADriverContextP va_ctx, VAContextID context_id)
 		ioctl(ctx->video_fd, VIDIOC_STREAMOFF, &type);
 	}
 
-	v4l2r_convert_destroy(ctx);
 	v4l2r_vpp_destroy(ctx);
 
 	for (unsigned int i = 0; i < V4L2R_OUTPUT_BUFFERS; i++)

@@ -149,10 +149,6 @@ VAStatus v4l2r_QuerySurfaceStatus(VADriverContextP va_ctx,
 
 	*status = surface->status;
 
-	/* Decoded but not yet run through the format converter. */
-	if (*status == VASurfaceReady && surface->convert_pending)
-		*status = VASurfaceRendering;
-
 	return VA_STATUS_SUCCESS;
 }
 
@@ -182,22 +178,11 @@ VAStatus v4l2r_QuerySurfaceAttributes(VADriverContextP va_ctx, VAConfigID config
 	attrib_list[i].value.value.i = VA_FOURCC_NV12;
 	i++;
 
-	/*
-	 * With a format converter available, 10-bit configs hand out NV12
-	 * surfaces (decoders here produce packed NV15, which the converter
-	 * turns into NV12 in hardware; nothing can display NV15 directly).
-	 * Advertising P010 alongside would make FFmpeg pick it as the exact
-	 * match and bypass the converter, landing on the slow CPU readback
-	 * path, so it is only offered when no converter exists.
-	 */
-	if ((cfg->rt_format & VA_RT_FORMAT_YUV420_10) &&
-	    !v4l2r_converter_available(drv)) {
-		attrib_list[i].type = VASurfaceAttribPixelFormat;
-		attrib_list[i].flags = VA_SURFACE_ATTRIB_GETTABLE | VA_SURFACE_ATTRIB_SETTABLE;
-		attrib_list[i].value.type = VAGenericValueTypeInteger;
-		attrib_list[i].value.value.i = VA_FOURCC_P010;
-		i++;
-	}
+	attrib_list[i].type = VASurfaceAttribPixelFormat;
+	attrib_list[i].flags = VA_SURFACE_ATTRIB_GETTABLE | VA_SURFACE_ATTRIB_SETTABLE;
+	attrib_list[i].value.type = VAGenericValueTypeInteger;
+	attrib_list[i].value.value.i = VA_FOURCC_P010;
+	i++;
 
 	attrib_list[i].type = VASurfaceAttribMemoryType;
 	attrib_list[i].flags = VA_SURFACE_ATTRIB_GETTABLE | VA_SURFACE_ATTRIB_SETTABLE;
@@ -253,10 +238,8 @@ VAStatus v4l2r_surface_ready(struct v4l2r_surface *surface)
 	v4l2r_trace("export sync (surface 0x%08x buf #%d): %.2f ms\n",
 		    surface->id, surface->capture_index,
 		    (v4l2r_now_ns() - t0) / 1e6);
-	if (status != VA_STATUS_SUCCESS)
-		return status;
 
-	return v4l2r_convert_wait(surface);
+	return status;
 }
 
 /* --- standalone surface backing --- */
@@ -421,65 +404,16 @@ next:
 static VAStatus backing_alloc_default(struct v4l2r_driver *drv,
 				      struct v4l2r_surface *surface)
 {
+	/* TODO: va_to_v4l2_fourcc */
 	uint32_t pixelformat = V4L2_PIX_FMT_NV12;
 
 	/* With a converter around, 10-bit configs hand out NV12 surfaces;
 	 * bare P010 only works on decoders that produce it natively. */
-	if (surface->fourcc == VA_FOURCC_P010 ||
-	    (!surface->fourcc &&
-	     (surface->rt_format & VA_RT_FORMAT_YUV420_10) &&
-	     !v4l2r_converter_available(drv)))
+	if (surface->fourcc == VA_FOURCC_P010)
 		pixelformat = V4L2_PIX_FMT_P010;
 
 	return backing_alloc(drv, surface, surface->width, surface->height,
 			     pixelformat);
-}
-
-/*
- * Backing used as the destination of the format converter: NV12 with the
- * exact layout of the converter's CAPTURE format. Kept (not replaced by
- * the decode CAPTURE buffer) for the whole life of the bound surface.
- */
-VAStatus v4l2r_surface_convert_backing(struct v4l2r_driver *drv,
-				       struct v4l2r_surface *surface)
-{
-	struct v4l2r_convert *conv = surface->ctx ? surface->ctx->conv : NULL;
-	const struct v4l2_pix_format_mplane *pix_mp;
-	VAStatus status;
-
-	if (!conv)
-		return VA_STATUS_ERROR_OPERATION_FAILED;
-
-	pix_mp = &conv->capture_format.fmt.pix_mp;
-
-	/* Backing left over from pre-decode probing may have the wrong
-	 * size; replace it. */
-	if (surface->backing &&
-	    (surface->backing->pixelformat != V4L2_PIX_FMT_NV12 ||
-	     surface->backing->nb_planes != 1 ||
-	     surface->backing->pitch != pix_mp->plane_fmt[0].bytesperline ||
-	     surface->backing->plane_size[0] < pix_mp->plane_fmt[0].sizeimage))
-		v4l2r_surface_free_backing(surface);
-
-	if (surface->backing)
-		return VA_STATUS_SUCCESS;
-
-	status = backing_alloc(drv, surface, pix_mp->width, pix_mp->height,
-			       V4L2_PIX_FMT_NV12);
-	if (status != VA_STATUS_SUCCESS)
-		return status;
-
-	if (surface->backing->nb_planes != 1 ||
-	    surface->backing->pitch != pix_mp->plane_fmt[0].bytesperline ||
-	    surface->backing->plane_size[0] < pix_mp->plane_fmt[0].sizeimage) {
-		v4l2r_log("conversion backing layout mismatch (pitch %u vs %u)\n",
-			  surface->backing->pitch,
-			  pix_mp->plane_fmt[0].bytesperline);
-		v4l2r_surface_free_backing(surface);
-		return VA_STATUS_ERROR_OPERATION_FAILED;
-	}
-
-	return VA_STATUS_SUCCESS;
 }
 
 /* --- unified surface memory view --- */
@@ -576,16 +510,8 @@ VAStatus v4l2r_surface_view(struct v4l2r_driver *drv,
 {
 	memset(view, 0, sizeof(*view));
 
-	/* With a conversion chain the decode CAPTURE buffer holds the raw
-	 * decoder format; what clients see is the converted NV12 backing. */
-	if (surface->ctx && surface->ctx->conv) {
-		if (!surface->backing &&
-		    v4l2r_surface_convert_backing(drv, surface) !=
-		    VA_STATUS_SUCCESS)
-			return VA_STATUS_ERROR_OPERATION_FAILED;
-	} else if (surface->ctx && surface->capture_index >= 0) {
+	if (surface->ctx && surface->capture_index >= 0)
 		return v4l2r_surface_capture_view(surface, need_maps, view);
-	}
 
 	/* Unbound surface: use (or create) standalone backing. */
 	if (!surface->backing) {

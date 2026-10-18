@@ -186,14 +186,9 @@ static int dequeue_buffer(struct v4l2r_context *ctx, enum v4l2_buf_type type)
 			  (unsigned long long)ctx->completed,
 			  __builtin_popcountll(ctx->queued_capture));
 		if (buffer.index < ctx->nb_captures &&
-		    ctx->captures[buffer.index].surface) {
+		    ctx->captures[buffer.index].surface)
 			ctx->captures[buffer.index].surface->status =
 				VASurfaceReady;
-			/* Start the format conversion right away so it
-			 * overlaps subsequent decodes. */
-			if (ctx->conv)
-				v4l2r_convert_kick(ctx, buffer.index);
-		}
 	}
 
 	return 0;
