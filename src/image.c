@@ -125,7 +125,6 @@ VAStatus v4l2r_DeriveImage(VADriverContextP va_ctx, VASurfaceID surface_id,
 	struct v4l2r_surface *surface;
 	struct v4l2r_image *image_object;
 	struct v4l2r_buffer *buffer;
-	struct v4l2r_frame_view view;
 	VAImageID image_id;
 	VABufferID buffer_id;
 	VAStatus status;
@@ -139,15 +138,15 @@ VAStatus v4l2r_DeriveImage(VADriverContextP va_ctx, VASurfaceID surface_id,
 	if (status != VA_STATUS_SUCCESS)
 		return status;
 
-	status = v4l2r_surface_view(drv, surface, true, &view);
+	status = v4l2r_surface_prepare(drv, surface, true);
 	if (status != VA_STATUS_SUCCESS)
 		return status;
 
-	if (!view.info->linear || !view.info->va_fourcc)
+	if (!surface->info->linear || !surface->info->va_fourcc)
 		return VA_STATUS_ERROR_OPERATION_FAILED;
 
 	/* Zero-copy is only possible when luma and chroma share one plane. */
-	if (view.nb_planes != 1)
+	if (surface->nb_planes != 1)
 		return VA_STATUS_ERROR_OPERATION_FAILED;
 
 	pthread_mutex_lock(&drv->mutex);
@@ -169,10 +168,10 @@ VAStatus v4l2r_DeriveImage(VADriverContextP va_ctx, VASurfaceID surface_id,
 
 	memset(image, 0, sizeof(*image));
 	image->image_id = image_id;
-	image->format.fourcc = view.info->va_fourcc;
+	image->format.fourcc = surface->info->va_fourcc;
 	image->format.byte_order = VA_LSB_FIRST;
 	image->format.bits_per_pixel =
-		view.info->va_fourcc == VA_FOURCC_P010 ? 24 : 12;
+		surface->info->va_fourcc == VA_FOURCC_P010 ? 24 : 12;
 
 	/*
 	 * The backing may be larger than the surface (decoders align their
@@ -182,12 +181,12 @@ VAStatus v4l2r_DeriveImage(VADriverContextP va_ctx, VASurfaceID surface_id,
 	 * for all surfaces of a pool when the image size does not match the
 	 * pool, and falls back to the much slower Get/PutImage path.
 	 */
-	status = image_setup_layout(image, view.info->va_fourcc,
-				    surface->width < view.width ?
-					surface->width : view.width,
-				    surface->height < view.height ?
-					surface->height : view.height,
-				    view.pitch, view.pitch * view.height);
+	status = image_setup_layout(image, surface->info->va_fourcc,
+				    surface->va.width < surface->width ?
+					surface->va.width : surface->width,
+				    surface->va.height < surface->height ?
+					surface->va.height : surface->height,
+				    surface->pitch, surface->pitch * surface->height);
 	if (status != VA_STATUS_SUCCESS) {
 		pthread_mutex_lock(&drv->mutex);
 		v4l2r_handles_free(&drv->buffers, buffer_id);
@@ -196,13 +195,13 @@ VAStatus v4l2r_DeriveImage(VADriverContextP va_ctx, VASurfaceID surface_id,
 		return status;
 	}
 
-	if (image->data_size > view.plane_size[0])
-		image->data_size = view.plane_size[0];
+	if (image->data_size > surface->plane_size[0])
+		image->data_size = surface->plane_size[0];
 
 	buffer->type = VAImageBufferType;
 	buffer->element_size = image->data_size;
 	buffer->nb_elements = 1;
-	buffer->data = view.map[0];
+	buffer->data = surface->map[0];
 	buffer->derived = true;
 
 	image->buf = buffer_id;
@@ -245,7 +244,6 @@ VAStatus v4l2r_GetImage(VADriverContextP va_ctx, VASurfaceID surface_id,
 	struct v4l2r_surface *surface;
 	struct v4l2r_image *image_object;
 	struct v4l2r_buffer *buffer;
-	struct v4l2r_frame_view view;
 	VAImage *image;
 	VAStatus status;
 	const uint8_t *src_luma, *src_chroma;
@@ -269,19 +267,19 @@ VAStatus v4l2r_GetImage(VADriverContextP va_ctx, VASurfaceID surface_id,
 	if (status != VA_STATUS_SUCCESS)
 		return status;
 
-	status = v4l2r_surface_view(drv, surface, true, &view);
+	status = v4l2r_surface_prepare(drv, surface, true);
 	if (status != VA_STATUS_SUCCESS)
 		return status;
 
-	if (!view.info->linear || !view.info->va_fourcc)
+	if (!surface->info->linear || !surface->info->va_fourcc)
 		return VA_STATUS_ERROR_OPERATION_FAILED;
 
-	if (image->format.fourcc != view.info->va_fourcc)
+	if (image->format.fourcc != surface->info->va_fourcc)
 		return VA_STATUS_ERROR_OPERATION_FAILED;
 
 	/* Bound the copy by both the surface view and the destination image so
 	 * a region larger than the image cannot overrun its buffer. */
-	if (width > view.width || height > view.height ||
+	if (width > surface->width || height > surface->height ||
 	    width > image->width || height > image->height)
 		return VA_STATUS_ERROR_OPERATION_FAILED;
 
@@ -289,39 +287,39 @@ VAStatus v4l2r_GetImage(VADriverContextP va_ctx, VASurfaceID surface_id,
 	if (!buffer)
 		return VA_STATUS_ERROR_INVALID_BUFFER;
 
-	src_luma = view.map[0];
-	if (view.nb_planes > 1)
-		src_chroma = view.map[1];
+	src_luma = surface->map[0];
+	if (surface->nb_planes > 1)
+		src_chroma = surface->map[1];
 	else
-		src_chroma = src_luma + view.pitch * view.height;
+		src_chroma = src_luma + surface->pitch * surface->height;
 
 	dst = buffer->data;
 
 	row_size = width;
-	if (view.info->va_fourcc == VA_FOURCC_P010)
+	if (surface->info->va_fourcc == VA_FOURCC_P010)
 		row_size *= 2;
 	if (row_size > image->pitches[0])
 		row_size = image->pitches[0];
-	if (row_size > view.pitch)
-		row_size = view.pitch;
+	if (row_size > surface->pitch)
+		row_size = surface->pitch;
 
 	/* Full rows with matching pitches: copy each plane in one go. */
-	if (row_size == view.pitch && image->pitches[0] == view.pitch &&
-	    image->pitches[1] == view.pitch) {
+	if (row_size == surface->pitch && image->pitches[0] == surface->pitch &&
+	    image->pitches[1] == surface->pitch) {
 		memcpy(dst + image->offsets[0], src_luma,
-		       (size_t)view.pitch * height);
+		       (size_t)surface->pitch * height);
 		memcpy(dst + image->offsets[1], src_chroma,
-		       (size_t)view.pitch * ((height + 1) / 2));
+		       (size_t)surface->pitch * ((height + 1) / 2));
 		return VA_STATUS_SUCCESS;
 	}
 
 	for (unsigned int i = 0; i < height; i++)
 		memcpy(dst + image->offsets[0] + i * image->pitches[0],
-		       src_luma + i * view.pitch, row_size);
+		       src_luma + i * surface->pitch, row_size);
 
 	for (unsigned int i = 0; i < (height + 1) / 2; i++)
 		memcpy(dst + image->offsets[1] + i * image->pitches[1],
-		       src_chroma + i * view.pitch, row_size);
+		       src_chroma + i * surface->pitch, row_size);
 
 	return VA_STATUS_SUCCESS;
 }
@@ -336,7 +334,6 @@ VAStatus v4l2r_PutImage(VADriverContextP va_ctx, VASurfaceID surface_id,
 	struct v4l2r_surface *surface;
 	struct v4l2r_image *image_object;
 	struct v4l2r_buffer *buffer;
-	struct v4l2r_frame_view view;
 	VAImage *image;
 	VAStatus status;
 	uint8_t *dst_luma, *dst_chroma;
@@ -365,19 +362,19 @@ VAStatus v4l2r_PutImage(VADriverContextP va_ctx, VASurfaceID surface_id,
 	if (status != VA_STATUS_SUCCESS)
 		return status;
 
-	status = v4l2r_surface_view(drv, surface, true, &view);
+	status = v4l2r_surface_prepare(drv, surface, true);
 	if (status != VA_STATUS_SUCCESS)
 		return status;
 
-	if (!view.info->linear || !view.info->va_fourcc)
+	if (!surface->info->linear || !surface->info->va_fourcc)
 		return VA_STATUS_ERROR_OPERATION_FAILED;
 
-	if (image->format.fourcc != view.info->va_fourcc)
+	if (image->format.fourcc != surface->info->va_fourcc)
 		return VA_STATUS_ERROR_OPERATION_FAILED;
 
 	/* Bound the copy by both the surface view and the source image so an
 	 * upload region larger than the image cannot overrun its buffer. */
-	if (width > view.width || height > view.height ||
+	if (width > surface->width || height > surface->height ||
 	    width > image->width || height > image->height)
 		return VA_STATUS_ERROR_OPERATION_FAILED;
 
@@ -385,39 +382,39 @@ VAStatus v4l2r_PutImage(VADriverContextP va_ctx, VASurfaceID surface_id,
 	if (!buffer)
 		return VA_STATUS_ERROR_INVALID_BUFFER;
 
-	dst_luma = view.map[0];
-	if (view.nb_planes > 1)
-		dst_chroma = view.map[1];
+	dst_luma = surface->map[0];
+	if (surface->nb_planes > 1)
+		dst_chroma = surface->map[1];
 	else
-		dst_chroma = dst_luma + view.pitch * view.height;
+		dst_chroma = dst_luma + surface->pitch * surface->height;
 
 	src = buffer->data;
 
 	row_size = width;
-	if (view.info->va_fourcc == VA_FOURCC_P010)
+	if (surface->info->va_fourcc == VA_FOURCC_P010)
 		row_size *= 2;
 	if (row_size > image->pitches[0])
 		row_size = image->pitches[0];
-	if (row_size > view.pitch)
-		row_size = view.pitch;
+	if (row_size > surface->pitch)
+		row_size = surface->pitch;
 
 	/* Full rows with matching pitches: copy each plane in one go. */
-	if (row_size == view.pitch && image->pitches[0] == view.pitch &&
-	    image->pitches[1] == view.pitch) {
+	if (row_size == surface->pitch && image->pitches[0] == surface->pitch &&
+	    image->pitches[1] == surface->pitch) {
 		memcpy(dst_luma, src + image->offsets[0],
-		       (size_t)view.pitch * height);
+		       (size_t)surface->pitch * height);
 		memcpy(dst_chroma, src + image->offsets[1],
-		       (size_t)view.pitch * ((height + 1) / 2));
+		       (size_t)surface->pitch * ((height + 1) / 2));
 		return VA_STATUS_SUCCESS;
 	}
 
 	for (unsigned int i = 0; i < height; i++)
-		memcpy(dst_luma + i * view.pitch,
+		memcpy(dst_luma + i * surface->pitch,
 		       src + image->offsets[0] + i * image->pitches[0],
 		       row_size);
 
 	for (unsigned int i = 0; i < (height + 1) / 2; i++)
-		memcpy(dst_chroma + i * view.pitch,
+		memcpy(dst_chroma + i * surface->pitch,
 		       src + image->offsets[1] + i * image->pitches[1],
 		       row_size);
 

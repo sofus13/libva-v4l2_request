@@ -148,14 +148,18 @@ struct v4l2r_config {
 	int nb_attributes;
 };
 
-/*
- * Standalone dma-buf backing for surfaces that have not (yet) been bound
- * to a decode context. Allocated from a decoder CAPTURE queue on a
- * throwaway fd; the exported dma-bufs keep the memory alive after the fd
- * is closed. Needed for clients (e.g. mpv) that export and map bare test
- * surfaces while probing formats.
- */
-struct v4l2r_surface_backing {
+struct v4l2r_surface {
+	struct v4l2r_context *ctx;	/* context the surface is bound to */
+	VASurfaceID id;			/* own VA id, for logging/tracing */
+	struct v4l2r_surface_vainfo {
+		unsigned int width;
+		unsigned int height;
+		unsigned int rt_format;
+		uint32_t fourcc;		/* requested pixel format, 0 = default */
+	} va;
+	int capture_index;		/* CAPTURE buffer index, -1 if unbound */
+	VASurfaceStatus status;
+
 	uint32_t pixelformat;
 	uint32_t width;
 	uint32_t height;
@@ -164,55 +168,21 @@ struct v4l2r_surface_backing {
 	uint32_t plane_size[VIDEO_MAX_PLANES];
 	int dmabuf_fd[VIDEO_MAX_PLANES];
 	void *map[VIDEO_MAX_PLANES];
-};
 
-struct v4l2r_surface {
-	struct v4l2r_context *ctx;	/* context the surface is bound to */
-	VASurfaceID id;			/* own VA id, for logging/tracing */
-	unsigned int width;
-	unsigned int height;
-	unsigned int rt_format;
-	uint32_t fourcc;		/* requested pixel format, 0 = default */
-	int capture_index;		/* CAPTURE buffer index, -1 if unbound */
-	VASurfaceStatus status;
-	struct v4l2r_surface_backing *backing;
+	const struct v4l2r_format_info *info;
+
 	/* Codec scratch, e.g. the AV1 order hint of the decoded frame. */
 	uint32_t codec_tag;
 };
 
-/*
- * Unified view of the memory behind a surface, whether it comes from a
- * context CAPTURE buffer or from standalone backing.
- */
-struct v4l2r_frame_view {
-	const struct v4l2r_format_info *info;
-	uint32_t pixelformat;
-	uint32_t width;
-	uint32_t height;
-	uint32_t pitch;
-	unsigned int nb_planes;
-	uint32_t plane_size[VIDEO_MAX_PLANES];
-	int dmabuf_fd[VIDEO_MAX_PLANES];	/* borrowed, do not close */
-	void *map[VIDEO_MAX_PLANES];		/* valid when maps requested */
-};
-
-/* Resolve the memory view of a surface, allocating standalone backing
- * for unbound surfaces on demand. */
-VAStatus v4l2r_surface_view(struct v4l2r_driver *drv,
-			    struct v4l2r_surface *surface, bool need_maps,
-			    struct v4l2r_frame_view *view);
-void v4l2r_surface_free_backing(struct v4l2r_surface *surface);
+VAStatus v4l2r_surface_prepare(struct v4l2r_driver *drv,
+			       struct v4l2r_surface *surface, bool need_maps);
 
 /* Per CAPTURE buffer state, lives in the context that allocated it. The
  * buffer holds the current decoded content of ->surface, or is free when
  * ->surface is NULL (its index then sits in the context free list). */
 struct v4l2r_capture_buffer {
 	struct v4l2r_surface *surface;
-	unsigned int nb_planes;
-	uint32_t plane_mem_offset[VIDEO_MAX_PLANES];
-	uint32_t plane_size[VIDEO_MAX_PLANES];
-	int dmabuf_fd[VIDEO_MAX_PLANES];	/* exported lazily, -1 if not */
-	void *map[VIDEO_MAX_PLANES];		/* mmap()ed lazily, NULL if not */
 	/* Submission count of the most recent frame that used this buffer as a
 	 * reference. A new decode may not overwrite the buffer until
 	 * ctx->completed reaches this value, i.e. until every frame that
@@ -265,6 +235,7 @@ struct v4l2r_context {
 	VAConfigID config_id;
 	VAProfile profile;
 	const struct v4l2r_codec *codec;
+	const struct v4l2r_decoder *decoder;
 	void *codec_priv;
 
 	int video_fd;
@@ -296,12 +267,6 @@ struct v4l2r_context {
 
 	struct v4l2r_capture_buffer captures[V4L2R_MAX_CAPTURE_BUFFERS];
 	unsigned int nb_captures;
-	/* FIFO of orphaned CAPTURE buffer indices left behind by destroyed
-	 * surfaces (V4L2 cannot free individual buffers); reused when a new
-	 * surface is bound for the first time. */
-	uint8_t free_captures[V4L2R_MAX_CAPTURE_BUFFERS];
-	unsigned int free_head;
-	unsigned int free_count;
 
 	struct v4l2r_picture pic;
 	bool in_picture;
@@ -527,19 +492,6 @@ VAStatus v4l2r_QueryVideoProcPipelineCaps(VADriverContextP va_ctx,
 /* Make a surface's pixels available for reading: submit a held-back decode,
  * wait for the decode itself and for any pending format conversion. */
 VAStatus v4l2r_surface_ready(struct v4l2r_surface *surface);
-
-/* View of a bound surface's decode CAPTURE buffer itself, even when a
- * conversion chain makes v4l2r_surface_view() present the converted backing
- * instead. Lets the video processing blit read the raw decoder output (e.g.
- * packed 10-bit NV15) and fold the downconversion into the same pass. */
-VAStatus v4l2r_surface_capture_view(struct v4l2r_surface *surface,
-				    bool need_maps,
-				    struct v4l2r_frame_view *view);
-
-/* Export the dma-buf fds of a context CAPTURE buffer (idempotent). */
-int v4l2r_export_capture_dmabufs(struct v4l2r_context *ctx,
-				 struct v4l2r_capture_buffer *capture,
-				 int capture_index);
 
 const struct v4l2r_codec *v4l2r_codec_for_profile(VAProfile profile);
 const struct v4l2r_codec **v4l2r_codec_list(unsigned int *count);

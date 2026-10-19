@@ -26,6 +26,29 @@
 #include "v4l2_request.h"
 #include "codec/codec.h"
 
+static void surface_unmap(struct v4l2r_surface *surface)
+{
+	surface->info = NULL;
+	surface->height = 0;
+	surface->width = 0;
+	surface->pitch = 0;
+
+	for (unsigned int i = 0; i < VIDEO_MAX_PLANES; i++) {
+		if (surface->map[i])
+			munmap(surface->map[i], surface->plane_size[i]);
+		if (surface->dmabuf_fd[i] >= 0)
+			close(surface->dmabuf_fd[i]);
+	}
+
+	surface->nb_planes = 0;
+	memset(surface->dmabuf_fd, -1,
+	       VIDEO_MAX_PLANES * sizeof(*surface->dmabuf_fd));
+	memset(surface->map, 0,
+	       VIDEO_MAX_PLANES * sizeof(*surface->map));
+	memset(surface->plane_size, 0,
+	       VIDEO_MAX_PLANES * sizeof(*surface->plane_size));
+}
+
 VAStatus v4l2r_CreateSurfaces2(VADriverContextP va_ctx, unsigned int format,
 			       unsigned int width, unsigned int height,
 			       VASurfaceID *surfaces, unsigned int num_surfaces,
@@ -57,12 +80,16 @@ VAStatus v4l2r_CreateSurfaces2(VADriverContextP va_ctx, unsigned int format,
 			goto fail;
 
 		surface->id = id;
-		surface->width = width;
-		surface->height = height;
-		surface->rt_format = format;
-		surface->fourcc = fourcc;
+		surface->va.width = width;
+		surface->va.height = height;
+		surface->va.rt_format = format;
+		surface->va.fourcc = fourcc;
 		surface->capture_index = -1;
 		surface->status = VASurfaceReady;
+
+		memset(surface->dmabuf_fd, -1,
+		       VIDEO_MAX_PLANES * sizeof(*surface->dmabuf_fd));
+		surface_unmap(surface);
 
 		surfaces[i] = id;
 	}
@@ -97,17 +124,12 @@ VAStatus v4l2r_DestroySurfaces(VADriverContextP va_ctx, VASurfaceID *surface_lis
 		if (!surface)
 			return VA_STATUS_ERROR_INVALID_SURFACE;
 
-		/* Wait for any pending decode (and conversion, which holds a
-		 * pointer to the surface); the CAPTURE buffer itself stays
-		 * with the context (V4L2 cannot free single buffers) but is
-		 * detached from the surface and returned to the free pool
-		 * for reuse by later decodes. */
 		v4l2r_surface_ready(surface);
 		if (surface->ctx && surface->capture_index >= 0)
 			v4l2r_context_release_capture(surface->ctx,
 						      surface->capture_index);
 
-		v4l2r_surface_free_backing(surface);
+		surface_unmap(surface);
 
 		pthread_mutex_lock(&drv->mutex);
 		v4l2r_handles_free(&drv->surfaces, surface_list[i]);
@@ -242,312 +264,209 @@ VAStatus v4l2r_surface_ready(struct v4l2r_surface *surface)
 	return status;
 }
 
-/* --- standalone surface backing --- */
-
-void v4l2r_surface_free_backing(struct v4l2r_surface *surface)
+static int try_format(int fd, struct v4l2_format *out,
+		      struct v4l2_format *cap)
 {
-	struct v4l2r_surface_backing *backing = surface->backing;
+	struct v4l2_format o = *out, c = *cap;
+	uint32_t width = c.fmt.pix_mp.width;
+	uint32_t height = c.fmt.pix_mp.height;
+	uint32_t pixelformat = c.fmt.pix_mp.pixelformat;
 
-	if (!backing)
-		return;
+	if (ioctl(fd, VIDIOC_S_FMT, &o) < 0)
+		return 1;
 
-	for (unsigned int i = 0; i < VIDEO_MAX_PLANES; i++) {
-		if (backing->map[i])
-			munmap(backing->map[i], backing->plane_size[i]);
-		if (backing->dmabuf_fd[i] >= 0)
-			close(backing->dmabuf_fd[i]);
-	}
+	if (ioctl(fd, VIDIOC_S_FMT, &c) < 0)
+		return 1;
 
-	free(backing);
-	surface->backing = NULL;
-}
+	if (c.fmt.pix_mp.pixelformat != pixelformat ||
+	    c.fmt.pix_mp.width < width ||
+	    c.fmt.pix_mp.height < height)
+		return 1;
 
-/*
- * Allocate dma-buf backing for a surface that is not bound to a decode
- * context, using the CAPTURE queue of one of the enumerated decoders on
- * a throwaway file descriptor. Each open of a mem2mem device is its own
- * instance, and the exported dma-bufs keep the memory alive after close.
- */
-static VAStatus backing_alloc(struct v4l2r_driver *drv,
-			      struct v4l2r_surface *surface,
-			      uint32_t width, uint32_t height,
-			      uint32_t pixelformat)
-{
-	struct v4l2r_surface_backing *backing;
-
-	backing = calloc(1, sizeof(*backing));
-	if (!backing)
-		return VA_STATUS_ERROR_ALLOCATION_FAILED;
-	for (unsigned int i = 0; i < VIDEO_MAX_PLANES; i++)
-		backing->dmabuf_fd[i] = -1;
-
-	/* Try each enumerated decoder until one produces the layout. */
-	for (unsigned int n = 0; n < drv->nb_decoders; n++) {
-		struct v4l2_capability capability = {0};
-		struct v4l2_create_buffers buffers;
-		struct v4l2_plane planes[VIDEO_MAX_PLANES] = {0};
-		struct v4l2_buffer buffer = {0};
-		struct v4l2_format format = {0};
-		unsigned int capabilities;
-		bool mplane;
-		int fd;
-
-		fd = open(drv->decoders[n].video_path, O_RDWR | O_CLOEXEC);
-		if (fd < 0)
-			continue;
-
-		if (ioctl(fd, VIDIOC_QUERYCAP, &capability) < 0)
-			goto next;
-
-		capabilities = (capability.capabilities & V4L2_CAP_DEVICE_CAPS) ?
-			       capability.device_caps : capability.capabilities;
-		mplane = capabilities & V4L2_CAP_VIDEO_M2M_MPLANE;
-
-		if (!mplane)
-			goto next;
-
-		/*
-		 * Stateless decoders derive the CAPTURE geometry from the
-		 * coded OUTPUT format and ignore the dimensions passed to
-		 * S_FMT(CAPTURE) (e.g. cedrus clamps CAPTURE to the OUTPUT
-		 * size, 16x16 on a freshly opened fd). Set a coded OUTPUT
-		 * format at the wanted size first so the CAPTURE queue reports
-		 * the resolution we actually asked for.
-		 */
-		struct v4l2_format out = {
-			.type = V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE,
-		};
-		uint32_t coded = drv->decoders[n].nb_pixelformats ?
-				 drv->decoders[n].pixelformats[0] : 0;
-
-		out.fmt.pix_mp.width = width;
-		out.fmt.pix_mp.height = height;
-		out.fmt.pix_mp.pixelformat = coded;
-		out.fmt.pix_mp.num_planes = 1;
-
-		if (coded && ioctl(fd, VIDIOC_S_FMT, &out) < 0)
-			goto next;
-
-		format.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
-		format.fmt.pix_mp.width = width;
-		format.fmt.pix_mp.height = height;
-		format.fmt.pix_mp.pixelformat = pixelformat;
-		format.fmt.pix_mp.num_planes = 1;
-
-		if (ioctl(fd, VIDIOC_S_FMT, &format) < 0)
-			goto next;
-
-		/* The device must produce exactly the requested layout. */
-		if (format.fmt.pix_mp.pixelformat != pixelformat ||
-		    format.fmt.pix_mp.width < width ||
-		    format.fmt.pix_mp.height < height)
-			goto next;
-		backing->width = format.fmt.pix_mp.width;
-		backing->height = format.fmt.pix_mp.height;
-		backing->pitch = format.fmt.pix_mp.plane_fmt[0].bytesperline;
-		backing->nb_planes = format.fmt.pix_mp.num_planes;
-
-		buffers = (struct v4l2_create_buffers) {
-			.count = 1,
-			.memory = V4L2_MEMORY_MMAP,
-			.format = format,
-		};
-		if (ioctl(fd, VIDIOC_CREATE_BUFS, &buffers) < 0)
-			goto next;
-
-		buffer.type = format.type;
-		buffer.index = buffers.index;
-		buffer.length = VIDEO_MAX_PLANES;
-		buffer.m.planes = planes;
-
-		if (ioctl(fd, VIDIOC_QUERYBUF, &buffer) < 0)
-			goto next;
-
-		backing->nb_planes = buffer.length;
-		for (unsigned int i = 0; i < buffer.length; i++)
-			backing->plane_size[i] = buffer.m.planes[i].length;
-
-		for (unsigned int i = 0; i < backing->nb_planes; i++) {
-			struct v4l2_exportbuffer exportbuffer = {
-				.type = format.type,
-				.index = buffer.index,
-				.plane = i,
-				.flags = O_RDWR | O_CLOEXEC,
-			};
-
-			if (ioctl(fd, VIDIOC_EXPBUF, &exportbuffer) < 0) {
-				for (unsigned int j = 0; j < i; j++) {
-					close(backing->dmabuf_fd[j]);
-					backing->dmabuf_fd[j] = -1;
-				}
-				goto next;
-			}
-
-			backing->dmabuf_fd[i] = exportbuffer.fd;
-		}
-
-		backing->pixelformat = pixelformat;
-		close(fd);
-
-		surface->backing = backing;
-		return VA_STATUS_SUCCESS;
-
-next:
-		close(fd);
-	}
-
-	free(backing);
-	return VA_STATUS_ERROR_OPERATION_FAILED;
-}
-
-/* Backing for a bare (unbound) surface, sized like the surface itself. */
-static VAStatus backing_alloc_default(struct v4l2r_driver *drv,
-				      struct v4l2r_surface *surface)
-{
-	/* TODO: va_to_v4l2_fourcc */
-	uint32_t pixelformat = V4L2_PIX_FMT_NV12;
-
-	/* With a converter around, 10-bit configs hand out NV12 surfaces;
-	 * bare P010 only works on decoders that produce it natively. */
-	if (surface->fourcc == VA_FOURCC_P010)
-		pixelformat = V4L2_PIX_FMT_P010;
-
-	return backing_alloc(drv, surface, surface->width, surface->height,
-			     pixelformat);
-}
-
-/* --- unified surface memory view --- */
-
-int v4l2r_export_capture_dmabufs(struct v4l2r_context *ctx,
-				 struct v4l2r_capture_buffer *capture,
-				 int capture_index)
-{
-	for (unsigned int i = 0; i < capture->nb_planes; i++) {
-		struct v4l2_exportbuffer exportbuffer = {
-			.type = ctx->capture_format.type,
-			.index = capture_index,
-			.plane = i,
-			.flags = O_RDWR | O_CLOEXEC,
-		};
-
-		if (capture->dmabuf_fd[i] >= 0)
-			continue;
-
-		if (ioctl(ctx->video_fd, VIDIOC_EXPBUF, &exportbuffer) < 0) {
-			v4l2r_log("failed to export CAPTURE buffer %d plane %u: %s\n",
-				  capture_index, i, strerror(errno));
-			return -errno;
-		}
-
-		capture->dmabuf_fd[i] = exportbuffer.fd;
-	}
+	*out = o;
+	*cap = c;
 
 	return 0;
 }
 
-VAStatus v4l2r_surface_capture_view(struct v4l2r_surface *surface,
-				    bool need_maps,
-				    struct v4l2r_frame_view *view)
+static int surface_alloc(struct v4l2r_decoder *dec,
+			 struct v4l2r_surface *surface,
+			 struct v4l2_format *ctx_cap,
+			 uint32_t pixfmt)
 {
-	struct v4l2r_context *ctx = surface->ctx;
-	struct v4l2r_capture_buffer *capture;
-	const struct v4l2_format *format;
-
-	memset(view, 0, sizeof(*view));
-
-	if (!ctx || surface->capture_index < 0)
-		return VA_STATUS_ERROR_INVALID_SURFACE;
-
-	capture = &ctx->captures[surface->capture_index];
-	format = &ctx->capture_format;
-
-	view->info = v4l2r_capture_format_info(ctx);
-	if (!view->info)
-		return VA_STATUS_ERROR_OPERATION_FAILED;
-
-	view->pixelformat = view->info->pixelformat;
-	view->width = format->fmt.pix_mp.width;
-	view->height = format->fmt.pix_mp.height;
-	view->pitch = format->fmt.pix_mp.plane_fmt[0].bytesperline;
-	view->nb_planes = capture->nb_planes;
-
-	if (v4l2r_export_capture_dmabufs(ctx, capture,
-					 surface->capture_index) < 0)
-		return VA_STATUS_ERROR_OPERATION_FAILED;
-
-	for (unsigned int i = 0; i < capture->nb_planes; i++) {
-		view->plane_size[i] = capture->plane_size[i];
-		view->dmabuf_fd[i] = capture->dmabuf_fd[i];
-	}
-
-	if (need_maps) {
-		for (unsigned int i = 0; i < capture->nb_planes; i++) {
-			if (!capture->map[i]) {
-				void *addr = mmap(NULL,
-					capture->plane_size[i],
-					PROT_READ | PROT_WRITE,
-					MAP_SHARED,
-					ctx->video_fd,
-					capture->plane_mem_offset[i]);
-				if (addr == MAP_FAILED)
-					return VA_STATUS_ERROR_OPERATION_FAILED;
-				capture->map[i] = addr;
-			}
-			view->map[i] = capture->map[i];
+	struct v4l2_capability capability = {0};
+	struct v4l2_create_buffers buffers;
+	struct v4l2_plane planes[VIDEO_MAX_PLANES] = {0};
+	struct v4l2_buffer buffer = {0};
+	struct v4l2_format out = {
+		.type = V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE,
+		.fmt.pix_mp = {
+			.num_planes = 1,
+			.width = surface->va.width,
+			.height = surface->va.height,
+			.pixelformat = dec->pixelformats[0],
 		}
+	};
+	struct v4l2_format cap = {
+		.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE,
+		.fmt.pix_mp = {
+			.num_planes = 1,
+			.width = surface->va.width,
+			.height = surface->va.height,
+			.pixelformat = pixfmt,
+		}
+	};
+	unsigned int capabilities;
+	bool mplane;
+	int fd, ret = 1;
+
+	fd = open(dec->video_path, O_RDWR | O_CLOEXEC);
+	if (fd < 0)
+		return fd;
+
+	if (ioctl(fd, VIDIOC_QUERYCAP, &capability) < 0)
+		goto done;
+
+	capabilities = (capability.capabilities & V4L2_CAP_DEVICE_CAPS) ?
+		       capability.device_caps : capability.capabilities;
+	mplane = capabilities & V4L2_CAP_VIDEO_M2M_MPLANE;
+
+	if (!mplane)
+		goto done;
+
+	if (!ctx_cap) {
+		if (try_format(fd, &out, &cap))
+			goto done;
+
+		/* make sure we have enough space */
+		cap.fmt.pix_mp.plane_fmt[0].sizeimage +=
+			cap.fmt.pix_mp.plane_fmt[0].sizeimage / 2;
+	} else {
+		cap = *ctx_cap;
 	}
 
-	return VA_STATUS_SUCCESS;
+	surface->width = cap.fmt.pix_mp.width;
+	surface->height = cap.fmt.pix_mp.height;
+	surface->pitch = cap.fmt.pix_mp.plane_fmt[0].bytesperline;
+	surface->nb_planes = cap.fmt.pix_mp.num_planes;
+
+	buffers = (struct v4l2_create_buffers) {
+		.count = 1,
+		.memory = V4L2_MEMORY_MMAP,
+		.format = cap,
+	};
+
+	if (ioctl(fd, VIDIOC_CREATE_BUFS, &buffers) < 0)
+		goto done;
+
+	buffer.type = cap.type;
+	buffer.index = buffers.index;
+	buffer.length = VIDEO_MAX_PLANES;
+	buffer.m.planes = planes;
+
+	if (ioctl(fd, VIDIOC_QUERYBUF, &buffer) < 0)
+		goto done;
+
+	surface->nb_planes = buffer.length;
+	for (unsigned int i = 0; i < buffer.length; i++)
+		surface->plane_size[i] = buffer.m.planes[i].length;
+
+	for (unsigned int i = 0; i < surface->nb_planes; i++) {
+		struct v4l2_exportbuffer exportbuffer = {
+			.type = cap.type,
+			.index = buffer.index,
+			.plane = i,
+			.flags = O_RDWR | O_CLOEXEC,
+		};
+
+		if (ioctl(fd, VIDIOC_EXPBUF, &exportbuffer) < 0)
+			goto done;
+
+		surface->dmabuf_fd[i] = exportbuffer.fd;
+	}
+
+	ret = 0;
+	surface->pixelformat = pixfmt;
+
+	{
+		unsigned long got = 0;
+		for (unsigned int i = 0; i < surface->nb_planes; i++)
+			got += surface->plane_size[i];
+
+		v4l2r_trace("allocated SURFACE 0x%x%s %.4s %.4s (%zu bytes, ~%llu MiB)\n",
+			    surface->id, ctx_cap ? "" : " (no ctx)",
+			    (const char *)&(uint32_t){pixfmt},
+			    (const char *)&(uint32_t){out.fmt.pix_mp.pixelformat},
+			    got, (unsigned long long)((uint64_t)got >> 20));
+	}
+
+done:
+	if (ret)
+		surface_unmap(surface);
+
+	close(fd);
+	return ret;
 }
 
-/*
- * Resolve the memory behind a surface: the CAPTURE buffer of the decode
- * context when bound, standalone backing (allocated on demand) otherwise.
- */
-VAStatus v4l2r_surface_view(struct v4l2r_driver *drv,
-			    struct v4l2r_surface *surface, bool need_maps,
-			    struct v4l2r_frame_view *view)
+static int surface_allocate(struct v4l2r_driver *drv,
+			    struct v4l2r_surface *surface)
 {
-	memset(view, 0, sizeof(*view));
+	struct v4l2r_decoder *dec;
+	uint32_t pixfmt;
 
-	if (surface->ctx && surface->capture_index >= 0)
-		return v4l2r_surface_capture_view(surface, need_maps, view);
+	if (surface->ctx && surface->capture_index >= 0) {
+		struct v4l2r_context *ctx = surface->ctx;
+		struct v4l2_format *cap = &ctx->capture_format;
 
-	/* Unbound surface: use (or create) standalone backing. */
-	if (!surface->backing) {
-		VAStatus status = backing_alloc_default(drv, surface);
-		if (status != VA_STATUS_SUCCESS)
-			return status;
-	}
+		dec = (struct v4l2r_decoder *)surface->ctx->decoder;
+		if (surface_alloc(dec, surface, cap,
+				  cap->fmt.pix_mp.pixelformat))
+			return 1;
+	} else {
+		if (surface->va.fourcc == VA_FOURCC_P010)
+			pixfmt = V4L2_PIX_FMT_P010;
+		else
+			pixfmt = V4L2_PIX_FMT_NV12;
 
-	view->info = v4l2r_format_by_pixelformat(surface->backing->pixelformat);
-	if (!view->info)
-		return VA_STATUS_ERROR_OPERATION_FAILED;
-
-	view->pixelformat = surface->backing->pixelformat;
-	view->width = surface->backing->width;
-	view->height = surface->backing->height;
-	view->pitch = surface->backing->pitch;
-	view->nb_planes = surface->backing->nb_planes;
-
-	for (unsigned int i = 0; i < surface->backing->nb_planes; i++) {
-		view->plane_size[i] = surface->backing->plane_size[i];
-		view->dmabuf_fd[i] = surface->backing->dmabuf_fd[i];
-	}
-
-	if (need_maps) {
-		for (unsigned int i = 0; i < surface->backing->nb_planes; i++) {
-			if (!surface->backing->map[i]) {
-				void *addr = mmap(NULL,
-					surface->backing->plane_size[i],
-					PROT_READ | PROT_WRITE, MAP_SHARED,
-					surface->backing->dmabuf_fd[i], 0);
-				if (addr == MAP_FAILED)
-					return VA_STATUS_ERROR_OPERATION_FAILED;
-				surface->backing->map[i] = addr;
-			}
-			view->map[i] = surface->backing->map[i];
+		for (unsigned int i = 0; i < drv->nb_decoders; i++) {
+			dec = &drv->decoders[i];
+			if (surface_alloc(dec, surface, NULL, pixfmt))
+				continue;
+			else
+				goto done;
 		}
+
+		return 1;
+	}
+
+done:
+	surface->info = v4l2r_format_by_pixelformat(surface->pixelformat);
+	if (!surface->info)
+		return 1;
+
+	return 0;
+}
+
+VAStatus v4l2r_surface_prepare(struct v4l2r_driver *drv,
+			    struct v4l2r_surface *surface, bool need_maps)
+{
+	if (!surface->nb_planes) {
+		if (surface_allocate(drv, surface))
+			return VA_STATUS_ERROR_OPERATION_FAILED;
+	}
+
+	if (!need_maps)
+		return VA_STATUS_SUCCESS;
+
+	for (unsigned int i = 0; i < surface->nb_planes; i++) {
+		if (surface->map[i])
+			continue;
+		void *addr = mmap(NULL, surface->plane_size[i],
+				  PROT_READ | PROT_WRITE, MAP_SHARED,
+				  surface->dmabuf_fd[i], 0);
+		if (addr == MAP_FAILED)
+			return VA_STATUS_ERROR_OPERATION_FAILED;
+		surface->map[i] = addr;
 	}
 
 	return VA_STATUS_SUCCESS;
@@ -557,7 +476,7 @@ VAStatus v4l2r_surface_view(struct v4l2r_driver *drv,
  * Describe the surface memory layout for DRM consumers, following the
  * layout rules of the FFmpeg v4l2-request hwcontext.
  */
-static VAStatus fill_prime_descriptor(const struct v4l2r_frame_view *view,
+static VAStatus fill_prime_descriptor(const struct v4l2r_surface *view,
 				      uint32_t flags,
 				      VADRMPRIMESurfaceDescriptor *desc)
 {
@@ -664,7 +583,6 @@ VAStatus v4l2r_ExportSurfaceHandle(VADriverContextP va_ctx, VASurfaceID surface_
 {
 	struct v4l2r_driver *drv = v4l2r_driver(va_ctx);
 	struct v4l2r_surface *surface;
-	struct v4l2r_frame_view view;
 	VAStatus status;
 
 	if (mem_type != VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2)
@@ -681,11 +599,11 @@ VAStatus v4l2r_ExportSurfaceHandle(VADriverContextP va_ctx, VASurfaceID surface_
 	 * frame. No-op for unbound or already-idle surfaces. */
 	v4l2r_surface_ready(surface);
 
-	status = v4l2r_surface_view(drv, surface, false, &view);
+	status = v4l2r_surface_prepare(drv, surface, false);
 	if (status != VA_STATUS_SUCCESS)
 		return status;
 
-	return fill_prime_descriptor(&view, flags, descriptor);
+	return fill_prime_descriptor(surface, flags, descriptor);
 }
 
 /* --- unsupported display path --- */

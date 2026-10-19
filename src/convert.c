@@ -321,8 +321,8 @@ static int vpp_set_rect(int fd, enum v4l2_buf_type type, uint32_t target,
  * processing context sees one layout for its whole life.
  */
 static VAStatus vpp_configure(struct v4l2r_context *ctx,
-			      const struct v4l2r_frame_view *src,
-			      const struct v4l2r_frame_view *dst)
+			      const struct v4l2r_surface *src,
+			      const struct v4l2r_surface *dst)
 {
 	struct v4l2r_vpp *vpp = ctx->vpp;
 	struct v4l2r_driver *drv = ctx->drv;
@@ -405,8 +405,8 @@ fail:
 
 /* Queue the source and destination dma-bufs and wait the job out. */
 static VAStatus vpp_run(struct v4l2r_vpp *vpp,
-			const struct v4l2r_frame_view *src,
-			const struct v4l2r_frame_view *dst)
+			const struct v4l2r_surface *src,
+			const struct v4l2r_surface *dst)
 {
 	struct v4l2_plane planes[VIDEO_MAX_PLANES];
 	struct v4l2_buffer buffer;
@@ -477,7 +477,6 @@ VAStatus v4l2r_vpp_end_picture(struct v4l2r_context *ctx)
 	struct v4l2r_vpp *vpp = ctx->vpp;
 	struct v4l2r_surface *src = vpp->src_surface;
 	struct v4l2r_surface *dst = ctx->pic.target;
-	struct v4l2r_frame_view src_view, dst_view;
 	VAStatus status;
 
 	if (!vpp->have_params || !dst || !src)
@@ -494,34 +493,34 @@ VAStatus v4l2r_vpp_end_picture(struct v4l2r_context *ctx)
 	 * the downconversion then happen in the same pass. Only without a
 	 * horizontal crop offset - the converter addresses crop columns in
 	 * whole bytes, which cannot land mid-byte in packed 10-bit layouts. */
-	status = v4l2r_surface_view(ctx->drv, src, false, &src_view);
+	status = v4l2r_surface_prepare(ctx->drv, src, false);
 	if (status != VA_STATUS_SUCCESS)
 		return status;
 
-	if (src_view.nb_planes != 1 ||
-	    !v4l2r_converter_supports(ctx->drv, src_view.pixelformat))
+	if (src->nb_planes != 1 ||
+	    !v4l2r_converter_supports(ctx->drv, src->pixelformat))
 		return VA_STATUS_ERROR_UNSUPPORTED_RT_FORMAT;
 
-	status = v4l2r_surface_view(ctx->drv, dst, false, &dst_view);
+	status = v4l2r_surface_prepare(ctx->drv, dst, false);
 	if (status != VA_STATUS_SUCCESS)
 		return status;
 
-	if (dst_view.nb_planes != 1 ||
-	    dst_view.pixelformat != V4L2_PIX_FMT_NV12)
+	if (dst->nb_planes != 1 ||
+	    dst->pixelformat != V4L2_PIX_FMT_NV12)
 		return VA_STATUS_ERROR_UNSUPPORTED_RT_FORMAT;
 
 	/* The source region is in pre-rotation coordinates (the converter
 	 * crops the source), the output region in destination coordinates
 	 * (it composes into the destination) - both as VA-API defines them. */
-	if (!vpp_region_valid(&vpp->src_region, src_view.width,
-			      src_view.height) ||
-	    !vpp_region_valid(&vpp->dst_region, dst_view.width,
-			      dst_view.height))
+	if (!vpp_region_valid(&vpp->src_region, src->width,
+			      src->height) ||
+	    !vpp_region_valid(&vpp->dst_region, dst->width,
+			      dst->height))
 		return VA_STATUS_ERROR_INVALID_PARAMETER;
 
 	pthread_mutex_lock(&ctx->mutex);
 
-	status = vpp_configure(ctx, &src_view, &dst_view);
+	status = vpp_configure(ctx, src, dst);
 	if (status != VA_STATUS_SUCCESS)
 		goto done;
 
@@ -542,7 +541,7 @@ VAStatus v4l2r_vpp_end_picture(struct v4l2r_context *ctx)
 		goto done;
 	}
 
-	status = vpp_run(vpp, &src_view, &dst_view);
+	status = vpp_run(vpp, src, dst);
 
 done:
 	if (status != VA_STATUS_SUCCESS) {

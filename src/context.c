@@ -294,22 +294,8 @@ int v4l2r_output_buffer_grow(struct v4l2r_context *ctx,
 
 /* --- CAPTURE buffer pool --- */
 
-static void capture_buffer_cleanup(struct v4l2r_context *ctx,
-				   struct v4l2r_capture_buffer *capture)
+static void capture_buffer_cleanup(struct v4l2r_capture_buffer *capture)
 {
-	(void)ctx;
-
-	for (unsigned int i = 0; i < VIDEO_MAX_PLANES; i++) {
-		if (capture->map[i]) {
-			munmap(capture->map[i], capture->plane_size[i]);
-			capture->map[i] = NULL;
-		}
-		if (capture->dmabuf_fd[i] >= 0) {
-			close(capture->dmabuf_fd[i]);
-			capture->dmabuf_fd[i] = -1;
-		}
-	}
-
 	if (capture->surface) {
 		capture->surface->ctx = NULL;
 		capture->surface->capture_index = -1;
@@ -317,29 +303,13 @@ static void capture_buffer_cleanup(struct v4l2r_context *ctx,
 	}
 }
 
-static void free_list_push(struct v4l2r_context *ctx, int index)
+static int find_cap(struct v4l2r_context *ctx)
 {
-	unsigned int tail = (ctx->free_head + ctx->free_count) %
-			    V4L2R_MAX_CAPTURE_BUFFERS;
+	for (unsigned int i = 0; i < ctx->nb_captures; i++)
+		if (!ctx->captures[i].surface)
+			return i;
 
-	/* Balanced by owned<->free transitions, so free_count never exceeds
-	 * nb_captures and the ring cannot overflow. */
-	ctx->free_captures[tail] = (uint8_t)index;
-	ctx->free_count++;
-}
-
-static int free_list_pop(struct v4l2r_context *ctx)
-{
-	int index;
-
-	if (!ctx->free_count)
-		return -1;
-
-	index = ctx->free_captures[ctx->free_head];
-	ctx->free_head = (ctx->free_head + 1) % V4L2R_MAX_CAPTURE_BUFFERS;
-	ctx->free_count--;
-
-	return index;
+	return -1;
 }
 
 /* Per-CAPTURE-buffer size implied by the negotiated format, in bytes. */
@@ -358,7 +328,7 @@ static int capture_buffer_new(struct v4l2r_context *ctx)
 {
 	struct v4l2_create_buffers buffers = {
 		.count = 1,
-		.memory = V4L2_MEMORY_MMAP,
+		.memory = V4L2_MEMORY_DMABUF,
 		.format = ctx->capture_format,
 	};
 	struct v4l2_plane planes[VIDEO_MAX_PLANES] = {0};
@@ -391,6 +361,7 @@ static int capture_buffer_new(struct v4l2r_context *ctx)
 	buffer.index = buffers.index;
 	buffer.length = VIDEO_MAX_PLANES;
 	buffer.m.planes = planes;
+	buffer.memory = V4L2_MEMORY_DMABUF;
 
 	if (ioctl(ctx->video_fd, VIDIOC_QUERYBUF, &buffer) < 0) {
 		v4l2r_log("failed to query CAPTURE buffer %u: %s\n",
@@ -401,22 +372,11 @@ static int capture_buffer_new(struct v4l2r_context *ctx)
 	capture = &ctx->captures[buffer.index];
 	memset(capture, 0, sizeof(*capture));
 
-	capture->nb_planes = ctx->capture_format.fmt.pix_mp.num_planes;
-	for (unsigned int i = 0; i < capture->nb_planes; i++) {
-		capture->plane_mem_offset[i] = buffer.m.planes[i].m.mem_offset;
-		capture->plane_size[i] = buffer.m.planes[i].length;
-	}
-
-	for (unsigned int i = 0; i < VIDEO_MAX_PLANES; i++)
-		capture->dmabuf_fd[i] = -1;
-
 	if (buffer.index >= ctx->nb_captures)
 		ctx->nb_captures = buffer.index + 1;
 
 	{
-		size_t got = 0;
-		for (unsigned int i = 0; i < capture->nb_planes; i++)
-			got += capture->plane_size[i];
+		size_t got = capture_format_bytes(&ctx->capture_format);
 		v4l2r_trace("allocated CAPTURE buffer #%u (%zu bytes); "
 			  "%u buffers, ~%llu MiB total\n", buffer.index, got,
 			  ctx->nb_captures,
@@ -436,13 +396,13 @@ static int capture_buffer_new(struct v4l2r_context *ctx)
  */
 static void capture_wait_readers(struct v4l2r_capture_buffer *capture)
 {
-	for (unsigned int i = 0; i < capture->nb_planes; i++) {
+	for (unsigned int i = 0; i < capture->surface->nb_planes; i++) {
 		struct pollfd pfd = {
-			.fd = capture->dmabuf_fd[i],
+			.fd = capture->surface->dmabuf_fd[i],
 			.events = POLLOUT,
 		};
 
-		if (capture->dmabuf_fd[i] < 0)
+		if (capture->surface->dmabuf_fd[i] < 0)
 			continue;
 
 		poll(&pfd, 1, V4L2R_POLL_TIMEOUT_MS);
@@ -476,7 +436,7 @@ static int capture_buffer_bind(struct v4l2r_context *ctx,
 		 * a destroyed surface, or grow the pool. */
 		bool recycled = true;
 
-		index = free_list_pop(ctx);
+		index = find_cap(ctx);
 		if (index < 0) {
 			recycled = false;
 			index = capture_buffer_new(ctx);
@@ -487,6 +447,13 @@ static int capture_buffer_bind(struct v4l2r_context *ctx,
 		ctx->captures[index].surface = surface;
 		surface->ctx = ctx;
 		surface->capture_index = index;
+
+		/*
+		 * prepare the surface after setting ctx and index so it uses
+		 * the selected pixelformat
+		 */
+		if (v4l2r_surface_prepare(ctx->drv, surface, false))
+			return -1;
 
 		v4l2r_trace("bind surface 0x%08x -> CAPTURE buffer #%d (%s)\n",
 			  surface->id, index, recycled ? "recycled" : "new");
@@ -533,12 +500,10 @@ void v4l2r_context_release_capture(struct v4l2r_context *ctx, int index)
 	/* Orphan the buffer for later recycling. It keeps its last_ref_seq so
 	 * a future decode that recycles it still waits out any frame that
 	 * referenced its contents. */
-	v4l2r_trace("release surface 0x%08x, orphan CAPTURE buffer #%d "
-		  "(free list now %u)\n",
-		  ctx->captures[index].surface->id, index, ctx->free_count + 1);
-	ctx->captures[index].surface->capture_index = -1;
-	ctx->captures[index].surface = NULL;
-	free_list_push(ctx, index);
+	v4l2r_trace("release surface 0x%08x, orphan CAPTURE buffer #%d\n",
+		  ctx->captures[index].surface->id, index);
+
+	capture_buffer_cleanup(&ctx->captures[index]);
 }
 
 void v4l2r_flush_surface(struct v4l2r_surface *surface)
@@ -587,12 +552,6 @@ VAStatus v4l2r_context_bind_surface(struct v4l2r_context *ctx,
 	ret = capture_buffer_bind(ctx, surface);
 	if (ret < 0)
 		return VA_STATUS_ERROR_ALLOCATION_FAILED;
-
-	/* The decode context provides the real storage now; drop any
-	 * standalone backing from pre-decode export probing. With a
-	 * conversion chain the backing IS the presented storage - keep it
-	 * (v4l2r_surface_convert_backing replaces a mismatched one). */
-	v4l2r_surface_free_backing(surface);
 
 	if (starting) {
 		type = ctx->capture_format.type;
@@ -692,12 +651,11 @@ VAStatus v4l2r_CreateContext(VADriverContextP va_ctx, VAConfigID config_id,
 		capabilities = (capability.capabilities & V4L2_CAP_DEVICE_CAPS) ?
 			       capability.device_caps : capability.capabilities;
 
-		if (capabilities & V4L2_CAP_VIDEO_M2M_MPLANE) {
-			ctx->output_format.type = V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE;
-			ctx->capture_format.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
-		} else {
+		if (!(capabilities & V4L2_CAP_VIDEO_M2M_MPLANE))
 			goto next;
-		}
+
+		ctx->output_format.type = V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE;
+		ctx->capture_format.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
 
 		if (!try_output_format(ctx, ctx->codec->pixelformat))
 			goto next;
@@ -705,11 +663,10 @@ VAStatus v4l2r_CreateContext(VADriverContextP va_ctx, VAConfigID config_id,
 		if (!try_framesize(ctx, ctx->codec->pixelformat))
 			goto next;
 
-		/* Initial bitstream buffer size: compressed frames rarely
-		 * exceed a quarter of the raw size, and the buffers grow on
-		 * demand (v4l2r_output_buffer_grow) - pre-booking the raw
-		 * frame size would pin tens of megabytes of CMA per 4K
-		 * context across the 4-buffer ring. */
+		/*
+		 * bitstream buffer sizes are normally small, set something
+		 * explicit to not waste to much memory
+		 */
 		buffersize = ctx->picture_width * ctx->picture_height / 4;
 		if (buffersize < 1024 * 1024)
 			buffersize = 1024 * 1024;
@@ -779,6 +736,8 @@ next:
 		goto fail;
 	}
 
+	ctx->decoder = decoder;
+
 	v4l2r_log("decoding %s via %s [%s] (media %s)\n",
 		  ctx->codec->name, decoder->video_path, decoder->card,
 		  decoder->media_path);
@@ -801,7 +760,12 @@ next:
 			status = VA_STATUS_ERROR_INVALID_SURFACE;
 			goto fail;
 		}
+		if (surface->ctx || surface->capture_index != -1)
+			v4l2r_log("overwriting surface 0x%x, has_ctx %s index %d\n",
+				  surface->id, surface->ctx ? "Y" : "N",
+				  surface->capture_index);
 		surface->ctx = ctx;
+		surface->capture_index = -1;
 	}
 
 	*context_id = id;
@@ -825,6 +789,8 @@ VAStatus v4l2r_DestroyContext(VADriverContextP va_ctx, VAContextID context_id)
 		return VA_STATUS_ERROR_INVALID_CONTEXT;
 
 	if (ctx->video_fd >= 0 && ctx->streaming) {
+		v4l2r_wait_completed(ctx, ctx->submitted);
+
 		type = ctx->output_format.type;
 		ioctl(ctx->video_fd, VIDIOC_STREAMOFF, &type);
 		type = ctx->capture_format.type;
@@ -837,7 +803,7 @@ VAStatus v4l2r_DestroyContext(VADriverContextP va_ctx, VAContextID context_id)
 		output_buffer_cleanup(ctx, &ctx->output[i]);
 
 	for (unsigned int i = 0; i < ctx->nb_captures; i++)
-		capture_buffer_cleanup(ctx, &ctx->captures[i]);
+		capture_buffer_cleanup(&ctx->captures[i]);
 
 	/* Detach surfaces that were attached but never bound. */
 	pthread_mutex_lock(&drv->mutex);
