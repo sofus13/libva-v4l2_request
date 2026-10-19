@@ -655,6 +655,18 @@ VAStatus v4l2r_surface_view(struct v4l2r_driver *drv,
 	return VA_STATUS_SUCCESS;
 }
 
+static int roundup_pow_of_two(int v)
+{
+    v -= 1;
+    v |= v >> 1;
+    v |= v >> 2;
+    v |= v >> 4;
+    v |= v >> 8;
+    v |= v >> 16;
+    v += 1;
+    return v;
+}
+
 /*
  * Describe the surface memory layout for DRM consumers, following the
  * layout rules of the FFmpeg v4l2-request hwcontext.
@@ -698,6 +710,17 @@ static VAStatus fill_prime_descriptor(const struct v4l2r_frame_view *view,
 
 	offset1 = pitch * height;
 	pitch1 = pitch;
+
+	if (pixelformat == V4L2_PIX_FMT_APPLE_IX12 ||
+	    pixelformat == V4L2_PIX_FMT_APPLE_IX03) {
+		/* Interchange */
+		int tw = (width + 31) / 32;
+		int th = (height + 31) / 32;
+		/* use bit_depth as a hack */
+		offset1 = ((32 * 32 * info->bit_depth + 7) / 8) * tw * th;
+		/* meta */
+		offset1 += roundup_pow_of_two(tw) * roundup_pow_of_two(th) * 32;
+	}
 
 #if defined(V4L2_PIX_FMT_NV12MT_COL128) && defined(V4L2_PIX_FMT_NV12MT_10_COL128)
 	if (pixelformat == V4L2_PIX_FMT_NV12MT_COL128 ||

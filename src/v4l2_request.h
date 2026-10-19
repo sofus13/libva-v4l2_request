@@ -47,6 +47,15 @@ static inline uint64_t v4l2r_now_ns(void)
 	return (uint64_t)ts.tv_sec * 1000000000ull + ts.tv_nsec;
 }
 
+#ifndef DRM_FORMAT_MOD_APPLE_INTERCHANGE
+#define DRM_FORMAT_MOD_APPLE_INTERCHANGE fourcc_mod_code(APPLE, 3)
+#endif
+
+#ifndef V4L2_PIX_FMT_APPLE_IX12
+#define V4L2_PIX_FMT_APPLE_IX12	v4l2_fourcc('I', 'X', '1', '2') /* Interchange NV12 */
+#define V4L2_PIX_FMT_APPLE_IX03	v4l2_fourcc('I', 'X', '0', '3') /* Interchange P030 */
+#endif
+
 #define V4L2R_MAX_PROFILES		32
 #define V4L2R_MAX_ENTRYPOINTS		4
 #define V4L2R_MAX_CONFIG_ATTRIBUTES	16

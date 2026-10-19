@@ -148,6 +148,8 @@ static int select_capture_format(struct v4l2r_context *ctx)
 			score += 2;
 		if (info->linear && info->va_fourcc && depth_ok)
 			score += 4;
+		if (depth_ok && !info->linear)
+			score += 20;
 
 		if (score > best_score) {
 			best_score = score;
@@ -604,30 +606,6 @@ VAStatus v4l2r_context_bind_surface(struct v4l2r_context *ctx,
 						&ctx->capture_capabilities);
 		if (ret < 0)
 			return VA_STATUS_ERROR_OPERATION_FAILED;
-
-		/*
-		 * When the decoder can only produce a format nothing can
-		 * consume directly (packed 10-bit NV15), chain the hardware
-		 * format converter behind it. Without a converter such a
-		 * stream cannot be presented at all: fail the decode so the
-		 * client falls back to software instead of getting frames
-		 * it cannot display.
-		 */
-		{
-			const struct v4l2r_format_info *info =
-				v4l2r_format_by_pixelformat(
-					v4l2r_format_pixelformat(&ctx->capture_format));
-
-			if (info && !info->va_fourcc) {
-				v4l2r_convert_setup(ctx);
-				if (!ctx->conv) {
-					v4l2r_log("no usable format converter for %.4s, "
-						  "refusing hardware decoding\n",
-						  (const char *)&info->pixelformat);
-					return VA_STATUS_ERROR_OPERATION_FAILED;
-				}
-			}
-		}
 
 		type = ctx->output_format.type;
 		if (ioctl(ctx->video_fd, VIDIOC_STREAMON, &type) < 0) {
