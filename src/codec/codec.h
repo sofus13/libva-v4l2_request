@@ -6,7 +6,7 @@
 #ifndef CODEC_H
 #define CODEC_H
 
-#include "v4l2_request.h"
+#include "../v4l2_request.h"
 
 /*
  * Codec backend: translates VA parameter buffers into V4L2 stateless

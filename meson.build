@@ -46,4 +46,28 @@ else
                                      default_value: get_option('prefix') / get_option('libdir') / 'dri')
 endif
 
-subdir('src')
+sources = [
+  'src/driver.c',
+  'src/handles.c',
+  'src/context.c',
+  'src/convert.c',
+  'src/decode.c',
+  'src/surface.c',
+  'src/buffer.c',
+  'src/image.c',
+  'src/codec/mpeg2.c',
+  'src/codec/h264.c',
+  'src/codec/hevc.c',
+  'src/codec/vp8.c',
+  'src/codec/vp9.c',
+  'src/codec/av1.c',
+]
+
+shared_module('v4l2_request_drv_video',
+              sources,
+              name_prefix: '',
+              include_directories: root_inc,
+              c_args: ['-fvisibility=hidden'],
+              dependencies: [libva_dep, libdrm_dep, threads_dep],
+              install: true,
+              install_dir: driverdir)
