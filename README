@@ -40,7 +40,7 @@ Building
 Run against a specific build without installing:
 
     export LIBVA_DRIVERS_PATH=/path/to/build/src
-    export LIBVA_DRIVER_NAME=v4l2_request
+    export LIBVA_DRIVER_NAME=asahi
     vainfo
 
 Environment variables:
@@ -63,12 +63,12 @@ libva normally derives the driver name from the DRM driver of the render
 node, which does not point at this driver on ARM SoCs (the GPU is
 panfrost or similar), so the driver has to be selected explicitly:
 
-    export LIBVA_DRIVER_NAME=v4l2_request
+    export LIBVA_DRIVER_NAME=asahi
     mpv --hwdec=vaapi video.mp4
 
 That is all an installed driver needs; for an uninstalled build also set
 LIBVA_DRIVERS_PATH as shown in "Building" above. To select it
-permanently, put LIBVA_DRIVER_NAME=v4l2_request into /etc/environment
+permanently, put LIBVA_DRIVER_NAME=asahi into /etc/environment
 (or set hwdec=vaapi in ~/.config/mpv/mpv.conf and export the variable
 from your session startup).
 
@@ -133,7 +133,7 @@ seat the seatd socket. Log in again for the groups to apply.)
 
 Then, from a VT or ssh login:
 
-    export LIBVA_DRIVER_NAME=v4l2_request
+    export LIBVA_DRIVER_NAME=asahi
 
     cat > west.conf <<EOF
     [output]
@@ -202,7 +202,7 @@ Firefox decodes video in its sandboxed RDD process, and the sandbox
 blocks the device access this driver needs (open/ioctl on /dev/video*
 and /dev/media* nodes). Launch Firefox with:
 
-    export LIBVA_DRIVER_NAME=v4l2_request
+    export LIBVA_DRIVER_NAME=asahi
     export MOZ_DISABLE_RDD_SANDBOX=1
     export MOZ_ENABLE_WAYLAND=1        # if not already running native Wayland
 

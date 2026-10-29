@@ -1,4 +1,4 @@
-project('libva-v4l2_request', 'c',
+project('asahi-va-driver', 'c',
         version: '1.2',
         license: 'GPL-3.0',
         default_options: [
@@ -25,6 +25,9 @@ codec_checks = {
 }
 
 conf = configuration_data()
+conf.set_quoted('DRIVER_VERSION', meson.project_version())
+conf.set_quoted('DRIVER_NAME', meson.project_name())
+
 foreach codec, ctrl : codec_checks
   have = cc.compiles('#include <linux/videodev2.h>\nint i = @0@;'.format(ctrl),
                      name: 'kernel supports stateless @0@'.format(codec))
@@ -63,7 +66,7 @@ sources = [
   'src/codec/av1.c',
 ]
 
-shared_module('v4l2_request_drv_video',
+shared_module('asahi_drv_video',
               sources,
               name_prefix: '',
               include_directories: root_inc,

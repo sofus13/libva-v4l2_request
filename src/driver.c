@@ -33,7 +33,7 @@ void v4l2r_log(const char *fmt, ...)
 {
 	va_list args;
 
-	fprintf(stderr, "libva-v4l2request: ");
+	fprintf(stderr, DRIVER_NAME ": ");
 	va_start(args, fmt);
 	vfprintf(stderr, fmt, args);
 	va_end(args);
@@ -59,7 +59,7 @@ void v4l2r_trace(const char *fmt, ...)
 		return;
 
 	clock_gettime(CLOCK_MONOTONIC, &ts);
-	n = snprintf(buf, sizeof(buf), "[%lld.%09ld] libva-v4l2request: ",
+	n = snprintf(buf, sizeof(buf), "[%lld.%09ld] " DRIVER_NAME ": ",
 		     (long long)ts.tv_sec, ts.tv_nsec);
 	if (n < 0 || (size_t)n >= sizeof(buf))
 		return;
@@ -890,7 +890,7 @@ VAStatus V4L2R_DRIVER_INIT(VADriverContextP va_ctx)
 	va_ctx->max_image_formats = V4L2R_MAX_IMAGE_FORMATS;
 	va_ctx->max_subpic_formats = V4L2R_MAX_SUBPIC_FORMATS;
 	va_ctx->max_display_attributes = V4L2R_MAX_DISPLAY_ATTRIBUTES;
-	va_ctx->str_vendor = V4L2R_STR_VENDOR;
+	va_ctx->str_vendor = DRIVER_NAME " " DRIVER_VERSION;
 
 	vtable->vaTerminate = v4l2r_Terminate;
 	vtable->vaQueryConfigProfiles = v4l2r_QueryConfigProfiles;
