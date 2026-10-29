@@ -3,7 +3,7 @@ project('libva-v4l2_request', 'c',
         license: 'GPL-3.0',
         default_options: [
           'c_std=gnu11',
-          'buildtype=debugoptimized',
+          'buildtype=release',
           'warning_level=2',
         ])
 
