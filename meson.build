@@ -1,5 +1,5 @@
 project('asahi-va-driver', 'c',
-        version: '1.2',
+        version: '2.0',
         license: 'GPL-3.0',
         default_options: [
           'c_std=gnu11',
